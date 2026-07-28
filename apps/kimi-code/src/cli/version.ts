@@ -16,6 +16,10 @@ import { KIMI_BUILD_INFO } from './build-info';
 
 const MODULE_DIR = import.meta.dirname;
 
+export const SWARM_CAPABILITY = 'agent-swarm-item-models-v1';
+export const SWARM_CAPABILITIES_ENV = 'KIMI_CODE_CAPABILITIES';
+export const SWARM_VERSION_ENV = 'KIMI_CODE_SWARM_VERSION';
+
 export function getHostPackageJsonPath(): string {
   // Walk upwards from this file's directory until a `package.json` shows up,
   // so both dev (`tsx src/main.ts` — this file in `src/cli/`, pkg 2 levels
@@ -46,6 +50,19 @@ export function getVersion(): string {
     version: string;
   };
   return pkg.version;
+}
+
+export function installSwarmRuntimeMetadata(
+  version = getVersion(),
+  env: Record<string, string | undefined> = process.env,
+): void {
+  const capabilities = (env[SWARM_CAPABILITIES_ENV] ?? '')
+    .split(',')
+    .map((capability) => capability.trim())
+    .filter((capability) => capability.length > 0);
+  if (!capabilities.includes(SWARM_CAPABILITY)) capabilities.push(SWARM_CAPABILITY);
+  env[SWARM_CAPABILITIES_ENV] = capabilities.join(',');
+  env[SWARM_VERSION_ENV] = version;
 }
 
 export function createKimiCodeHostIdentity(version = getVersion()): KimiHostIdentity {

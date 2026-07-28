@@ -112,6 +112,7 @@ interface AgentSwarmMember {
   phase: AgentSwarmPhase;
   ticks: number;
   itemText: string;
+  requestedModelAlias?: string;
   latestModelText: string;
   completedText?: string;
   failureText?: string;
@@ -246,7 +247,9 @@ export class AgentSwarmProgressComponent implements Component {
     if (description.length > 0 || this.description.length === 0) {
       this.description = description;
     }
-    const fullRows = [...agentSwarmResumeItemsFromArgs(args), ...agentSwarmItemsFromArgs(args)];
+    const resumedRows = agentSwarmResumeItemsFromArgs(args);
+    const itemRows = agentSwarmItemRowsFromArgs(args);
+    const fullRows = [...resumedRows, ...itemRows.map((item) => item.itemText)];
     const partialRows = streamingArguments === undefined
       ? []
       : [
@@ -274,6 +277,7 @@ export class AgentSwarmProgressComponent implements Component {
     const itemCount = Math.max(fullRows.length, partialRows.length);
     if (itemCount > 0) this.ensureMemberCount(itemCount);
     this.updateItemTexts(fullRows, partialRows);
+    this.updateRequestedModelAliases(itemRows, resumedRows.length);
   }
 
   markInputComplete(): void {
@@ -703,6 +707,14 @@ export class AgentSwarmProgressComponent implements Component {
     }
   }
 
+  private updateRequestedModelAliases(items: readonly AgentSwarmItemRow[], offset: number): void {
+    for (const [index, item] of items.entries()) {
+      const member = this.members[offset + index];
+      if (member === undefined) continue;
+      member.requestedModelAlias = item.requestedModelAlias;
+    }
+  }
+
   private startAnimationIfNeeded(): void {
     if (this.requestRender === undefined || this.timer !== undefined) return;
     if (!this.hasAnimatedMembers()) return;
@@ -817,10 +829,29 @@ function terminalPhaseElapsedMs(member: AgentSwarmMember, nowMs: number): number
   return startedAtMs === undefined ? 0 : Math.max(0, nowMs - startedAtMs);
 }
 
-export function agentSwarmItemsFromArgs(args: Record<string, unknown>): string[] {
+interface AgentSwarmItemRow {
+  readonly itemText: string;
+  readonly requestedModelAlias?: string;
+}
+
+function agentSwarmItemRowsFromArgs(args: Record<string, unknown>): AgentSwarmItemRow[] {
   const items = args['items'];
   if (!Array.isArray(items)) return [];
-  return items.map(String);
+  return items.flatMap((item) => {
+    if (isAgentSwarmObjectItem(item)) {
+      const modelAlias = item['model_alias'];
+      return [{
+        itemText: item.item,
+        requestedModelAlias: typeof modelAlias === 'string' ? modelAlias : undefined,
+      }];
+    }
+    if (typeof item === 'object' && item !== null) return [];
+    return [{ itemText: String(item) }];
+  });
+}
+
+export function agentSwarmItemsFromArgs(args: Record<string, unknown>): string[] {
+  return agentSwarmItemRowsFromArgs(args).map((item) => item.itemText);
 }
 
 function agentSwarmResumeItemsFromArgs(args: Record<string, unknown>): string[] {
@@ -847,20 +878,28 @@ export function agentSwarmPartialItemsFromArguments(argumentsText: string): stri
   const match = /"items"\s*:\s*\[/.exec(argumentsText);
   if (match === null) return [];
   const items: string[] = [];
-  for (let i = match.index + match[0].length; i < argumentsText.length; i += 1) {
-    const ch = argumentsText[i];
-    if (ch === ']') return items;
-    if (ch !== '"') continue;
-
-    const parsed = parsePartialJsonString(argumentsText, i + 1);
-    items.push(parsed.value);
-    if (parsed.closed) {
-      i = parsed.nextIndex;
-      continue;
+  for (let index = match.index + match[0].length; index < argumentsText.length; index += 1) {
+    const ch = argumentsText[index];
+    if (ch === undefined || ch === ']') return items;
+    if (ch === ',' || /\s/.test(ch)) continue;
+    if (ch === '{') {
+      items.push('');
+      return items;
     }
-    return items;
+    if (ch !== '"') return items;
+
+    const parsed = parsePartialJsonString(argumentsText, index + 1);
+    items.push(parsed.value);
+    if (!parsed.closed) return items;
+    index = parsed.nextIndex;
   }
   return items;
+}
+
+function isAgentSwarmObjectItem(
+  value: unknown,
+): value is Record<string, unknown> & { readonly item: string } {
+  return typeof value === 'object' && value !== null && typeof (value as Record<string, unknown>)['item'] === 'string';
 }
 
 function agentSwarmPartialResumeItemsFromArguments(argumentsText: string): string[] {
@@ -1383,7 +1422,12 @@ function renderCellLabel(
     return truncateWithColor(`${FAILURE_MARK}${member.failureText}`, width, colors.error);
   }
   if (snapshot.phase === 'completed') {
-    return renderCompletedCellLabel(member.completedText ?? latestLine, width, colors);
+    return renderCompletedCellLabel(
+      member.completedText ?? latestLine,
+      width,
+      colors,
+      member.requestedModelAlias,
+    );
   }
   if (snapshot.phase === 'cancelled') {
     return renderCancelledCellLabel(member, width, colors);
@@ -1393,9 +1437,16 @@ function renderCellLabel(
 
 function runningCellLabelText(member: AgentSwarmMember): string {
   const latestLine = latestNonEmptyLine(member.latestModelText);
-  const itemText = collapseWhitespace(member.itemText);
-  const text = latestLine.length > 0 ? latestLine : itemText;
+  const itemLabel = memberItemLabel(member);
+  const text = latestLine.length > 0 ? latestLine : itemLabel;
   return text.length > 0 ? text : PHASE_LABELS.running;
+}
+
+function memberItemLabel(member: AgentSwarmMember): string {
+  const itemText = collapseWhitespace(member.itemText);
+  const alias = collapseWhitespace(member.requestedModelAlias ?? '');
+  if (itemText.length === 0) return alias;
+  return alias.length === 0 ? itemText : `${itemText} · ${alias}`;
 }
 
 function renderCancelledCellLabel(
@@ -1418,9 +1469,12 @@ function renderCompletedCellLabel(
   text: string,
   width: number,
   colors: ColorPalette,
+  requestedModelAlias?: string,
 ): string {
   const finalText = normalizeFinalOutputText(text);
-  const label = finalText === undefined ? SUCCESS_MARK.trimEnd() : `${SUCCESS_MARK}${finalText}`;
+  const alias = collapseWhitespace(requestedModelAlias ?? '');
+  const prefix = alias.length === 0 ? SUCCESS_MARK : `${SUCCESS_MARK}[${alias}] `;
+  const label = finalText === undefined ? prefix.trimEnd() : `${prefix}${finalText}`;
   return truncateWithColor(label, width, colors.success);
 }
 
@@ -1444,8 +1498,8 @@ function renderPendingCell(
 ): string {
   const id = chalk.hex(colors.primary)(member.id);
   const prefix = `${id} `;
-  const itemText = collapseWhitespace(member.itemText);
-  const label = itemText.length > 0 ? itemText : QUEUED_LABEL;
+  const itemLabel = memberItemLabel(member);
+  const label = itemLabel.length > 0 ? itemLabel : QUEUED_LABEL;
   const labelWidth = Math.max(1, width - visibleWidth(prefix));
   return prefix + truncateWithColor(label, labelWidth, colors.textDim);
 }
@@ -1457,8 +1511,9 @@ function renderQueuedCell(
 ): string {
   const id = chalk.hex(colors.primary)(member.id);
   const prefix = `${id} `;
+  const label = member.requestedModelAlias === undefined ? QUEUED_LABEL : memberItemLabel(member);
   const labelWidth = Math.max(1, width - visibleWidth(prefix));
-  return prefix + truncateWithColor(QUEUED_LABEL, labelWidth, colors.textDim);
+  return prefix + truncateWithColor(label, labelWidth, colors.textDim);
 }
 
 function renderCancelledUnstartedCell(

@@ -8,11 +8,13 @@
 import { Readable, type Writable } from 'node:stream';
 
 import type { Kaos, KaosProcess } from '@moonshot-ai/kaos';
+import { UNKNOWN_CAPABILITY } from '@moonshot-ai/kosong';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Agent } from '../../src/agent';
 import type { SwarmMode } from '../../src/agent/swarm';
 import { FLAG_DEFINITIONS, FlagResolver } from '../../src/flags';
+import type { ResolvedRuntimeProvider } from '../../src/session/provider-manager';
 import {
   DEFAULT_SUBAGENT_TIMEOUT_MS,
   type QueuedSubagentRunResult,
@@ -91,6 +93,20 @@ function agentTool(host: SessionSubagentHost): AgentTool {
 
 function mockSwarmMode(): SwarmMode {
   return { enter: vi.fn() } as unknown as SwarmMode;
+}
+
+function mockResolvedRuntimeProvider(
+  alias: string,
+  overrides?: Partial<ResolvedRuntimeProvider>,
+): ResolvedRuntimeProvider {
+  return {
+    providerName: 'test',
+    provider: { type: 'kimi', model: alias, apiKey: 'test-key' },
+    modelCapabilities: UNKNOWN_CAPABILITY,
+    type: 'kimi',
+    protocol: undefined,
+    ...overrides,
+  };
 }
 
 function processWithOutput(stdout: string, exitCode = 0): KaosProcess {
@@ -433,6 +449,209 @@ describe('current builtin collaboration tools', () => {
       '</agent_swarm_result>',
     ].join('\n'));
     expect(result.isError).toBeUndefined();
+  });
+
+  it('AgentSwarm routes strict object items while plain strings keep inheritance', async () => {
+    const runQueued = vi.fn(async <T>(tasks: readonly QueuedSubagentTask<T>[]) =>
+      tasks.map((task, index) => ({
+        task,
+        agentId: `agent-${String(index + 1)}`,
+        status: 'completed' as const,
+        result: 'done',
+      })),
+    );
+    const configuredAliases = new Set(['provider/model-a', 'provider/model-b']);
+    const modelProvider = {
+      resolveProviderConfig: vi.fn((alias: string) => {
+        if (!configuredAliases.has(alias)) throw new Error('not configured');
+        return mockResolvedRuntimeProvider(alias);
+      }),
+    };
+    const tool = new AgentSwarmTool(
+      mockSubagentHost({ runQueued: runQueued as unknown as SessionSubagentHost['runQueued'] }),
+      mockSwarmMode(),
+      undefined,
+      modelProvider,
+      () => 'parent-model',
+    );
+    const input = {
+      description: 'Review files',
+      prompt_template: 'Review {{item}}',
+      items: [
+        { item: 'src/a.ts', model_alias: 'provider/model-a' },
+        { item: 'src/b.ts', model_alias: 'provider/model-b' },
+        'src/c.ts',
+      ],
+    };
+
+    expect(AgentSwarmToolInputSchema.safeParse(input).success).toBe(true);
+    expect(
+      AgentSwarmToolInputSchema.safeParse({
+        ...input,
+        items: [{ item: 'src/a.ts', model_alias: 'provider/model-a', extra: true }, 'src/b.ts'],
+      }).success,
+    ).toBe(false);
+
+    const result = await executeTool(tool, context(input, 'call_swarm'));
+    const tasks = runQueued.mock.calls[0]?.[0] as readonly QueuedSubagentTask[];
+
+    expect(tasks[0]).toMatchObject({
+      prompt: 'Review src/a.ts',
+      swarmItem: 'src/a.ts',
+      binding: { source: 'agent-swarm-item', modelAlias: 'provider/model-a' },
+    });
+    expect(tasks[1]).toMatchObject({
+      prompt: 'Review src/b.ts',
+      swarmItem: 'src/b.ts',
+      binding: { source: 'agent-swarm-item', modelAlias: 'provider/model-b' },
+    });
+    expect(tasks[2]).toHaveProperty('binding', undefined);
+    expect(modelProvider.resolveProviderConfig).toHaveBeenCalledWith('provider/model-a');
+    expect(modelProvider.resolveProviderConfig).toHaveBeenCalledWith('provider/model-b');
+    expect(result.isError).toBeUndefined();
+  });
+
+  it('AgentSwarm rejects configured model aliases embedded in string items', async () => {
+    const runQueued = vi.fn();
+    const modelProvider = {
+      resolveProviderConfig: vi.fn((alias: string) => {
+        if (alias !== 'provider/model-a') throw new Error('not configured');
+        return mockResolvedRuntimeProvider(alias);
+      }),
+    };
+    const tool = new AgentSwarmTool(
+      mockSubagentHost({ runQueued: runQueued as unknown as SessionSubagentHost['runQueued'] }),
+      mockSwarmMode(),
+      undefined,
+      modelProvider,
+      () => 'parent-model',
+    );
+
+    const result = await executeTool(
+      tool,
+      context({
+        description: 'Compare models',
+        prompt_template: 'Review with {{item}}',
+        items: ['Gemini（provider/model-a）', 'ordinary task'],
+      }),
+    );
+
+    expect(result).toMatchObject({
+      isError: true,
+      output: expect.stringContaining(
+        'string items do not select models. Use an object item with model_alias',
+      ),
+    });
+    expect(runQueued).not.toHaveBeenCalled();
+  });
+
+  it('AgentSwarm uses the selected model default thinking when omitted', async () => {
+    const runQueued = vi.fn(async <T>(tasks: readonly QueuedSubagentTask<T>[]) =>
+      tasks.map((task) => ({ task, status: 'completed' as const, result: 'done' })),
+    );
+    const modelProvider = {
+      resolveProviderConfig: vi.fn((alias: string) => {
+        if (alias !== 'provider/model-a') throw new Error('not configured');
+        return mockResolvedRuntimeProvider(alias, {
+          modelCapabilities: { ...UNKNOWN_CAPABILITY, thinking: true },
+          supportEfforts: ['medium', 'high'],
+          defaultEffort: 'high',
+        });
+      }),
+    };
+    const tool = new AgentSwarmTool(
+      mockSubagentHost({ runQueued: runQueued as unknown as SessionSubagentHost['runQueued'] }),
+      mockSwarmMode(),
+      undefined,
+      modelProvider,
+      () => 'parent-model',
+    );
+
+    const result = await executeTool(
+      tool,
+      context({
+        description: 'Review files',
+        prompt_template: 'Review {{item}}',
+        items: [{ item: 'src/a.ts', model_alias: 'provider/model-a' }, 'src/b.ts'],
+      }),
+    );
+
+    expect(runQueued.mock.calls[0]?.[0]?.[0]).toMatchObject({
+      binding: { modelAlias: 'provider/model-a', thinkingEffort: 'high' },
+    });
+    expect(runQueued.mock.calls[0]?.[0]?.[1]).toHaveProperty('binding', undefined);
+    expect(result.isError).toBeUndefined();
+  });
+
+  it('AgentSwarm rejects unsupported thinking before launching children', async () => {
+    const runQueued = vi.fn();
+    const modelProvider = {
+      resolveProviderConfig: vi.fn((alias: string) =>
+        mockResolvedRuntimeProvider(alias, {
+          modelCapabilities: { ...UNKNOWN_CAPABILITY, thinking: true },
+          supportEfforts: ['medium', 'high'],
+          defaultEffort: 'medium',
+        }),
+      ),
+    };
+    const tool = new AgentSwarmTool(
+      mockSubagentHost({ runQueued: runQueued as unknown as SessionSubagentHost['runQueued'] }),
+      mockSwarmMode(),
+      undefined,
+      modelProvider,
+      () => 'parent-model',
+    );
+
+    const result = await executeTool(
+      tool,
+      context({
+        description: 'Review files',
+        prompt_template: 'Review {{item}}',
+        items: [
+          { item: 'src/a.ts', model_alias: 'provider/model-a', thinking: 'low' },
+          'src/b.ts',
+        ],
+      }),
+    );
+
+    expect(result).toMatchObject({
+      isError: true,
+      output:
+        'Thinking effort "low" is not supported by model alias "provider/model-a". Supported efforts: off, medium, high.',
+    });
+    expect(runQueued).not.toHaveBeenCalled();
+  });
+
+  it('AgentSwarm rejects unresolved item aliases before any child starts', async () => {
+    const runQueued = vi.fn();
+    const modelProvider = {
+      resolveProviderConfig: vi.fn(() => {
+        throw new Error('not configured');
+      }),
+    };
+    const swarmMode = mockSwarmMode();
+    const tool = new AgentSwarmTool(
+      mockSubagentHost({ runQueued: runQueued as unknown as SessionSubagentHost['runQueued'] }),
+      swarmMode,
+      undefined,
+      modelProvider,
+      () => 'parent-model',
+    );
+
+    const result = await executeTool(
+      tool,
+      context({
+        description: 'Review files',
+        prompt_template: 'Review {{item}}',
+        items: [{ item: 'src/a.ts', model_alias: 'provider/missing' }, 'src/b.ts'],
+      }),
+    );
+
+    expect(result).toMatchObject({
+      isError: true,
+      output: 'Model alias "provider/missing" is not configured.',
+    });
+    expect(runQueued).not.toHaveBeenCalled();
   });
 
   it('AgentSwarm does not expose permission rule argument matching', () => {

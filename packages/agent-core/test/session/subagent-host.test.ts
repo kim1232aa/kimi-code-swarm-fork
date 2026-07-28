@@ -3,7 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'pathe';
 
 import { testKaos } from '../fixtures/test-kaos';
-import { APIStatusError, type Message, type ToolCall } from '@moonshot-ai/kosong';
+import {
+  APIStatusError,
+  UNKNOWN_CAPABILITY,
+  type Message,
+  type ToolCall,
+} from '@moonshot-ai/kosong';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { Agent, AgentOptions } from '../../src/agent';
@@ -17,7 +22,7 @@ import {
   SessionSubagentHost,
   formatSubagentTimeoutDescription,
   resolveSubagentTimeoutMs,
-  type QueuedSubagentTask,
+  type SpawnQueuedSubagentTask,
 } from '../../src/session/subagent-host';
 import { abortError, userCancellationReason } from '../../src/utils/abort';
 import { testAgent, type AgentTestContext } from '../agent/harness/agent';
@@ -1008,10 +1013,18 @@ describe('SessionSubagentHost', () => {
   it('runQueued persists swarm item metadata for spawned tasks', async () => {
     const parent = testAgent();
     parent.configure();
+    parent.configureRuntimeModel(
+      { type: 'kimi', model: 'item-model', apiKey: 'test-key' },
+      { ...UNKNOWN_CAPABILITY, thinking: true },
+    );
     parent.newEvents();
 
     const child = testAgent({ type: 'sub' });
     child.configure();
+    child.configureRuntimeModel(
+      { type: 'kimi', model: 'item-model', apiKey: 'test-key' },
+      { ...UNKNOWN_CAPABILITY, thinking: true },
+    );
     const summary =
       'Completed the queued swarm item and returned a detailed technical handoff so the parent can map the result back to the original swarm input. '.repeat(
         2,
@@ -1023,7 +1036,18 @@ describe('SessionSubagentHost', () => {
     const host = new SessionSubagentHost(session, 'main');
 
     await expect(
-      host.runQueued([{ ...queuedTask(1), swarmItem: 'src/a.ts', signal }]),
+      host.runQueued([
+        {
+          ...queuedTask(1),
+          swarmItem: 'src/a.ts',
+          binding: {
+            source: 'agent-swarm-item',
+            modelAlias: 'item-model',
+            thinkingEffort: 'on',
+          },
+          signal,
+        },
+      ]),
     ).resolves.toMatchObject([
       {
         agentId: 'agent-0',
@@ -1037,13 +1061,17 @@ describe('SessionSubagentHost', () => {
       expect.objectContaining({
         parentAgentId: 'main',
         swarmItem: 'src/a.ts',
+        modelBinding: { source: 'agent-swarm-item' },
       }),
     );
     expect(metadataAgents['agent-0']).toMatchObject({
       type: 'sub',
       parentAgentId: 'main',
       swarmItem: 'src/a.ts',
+      modelBinding: { source: 'agent-swarm-item' },
     });
+    expect(child.agent.config.modelAlias).toBe('item-model');
+    expect(child.agent.config.thinkingEffort).toBe('on');
     expect(host.getSwarmItem('agent-0')).toBe('src/a.ts');
     expect(parent.allEvents).toContainEqual(
       expect.objectContaining({
@@ -1128,16 +1156,17 @@ describe('SessionSubagentHost', () => {
     expect(userTextMessages(histories[1] ?? [])).toEqual(['Implement the retry-safe change']);
   });
 
-  it('realigns a resumed subagent to the parent agent current model', async () => {
+  it('preserves an item-bound subagent model when it resumes', async () => {
     const parent = testAgent();
     parent.configure();
+    parent.configureRuntimeModel({ type: 'kimi', model: 'item-model', apiKey: 'test-key' });
+    parent.configureRuntimeModel({ type: 'kimi', model: 'parent-model', apiKey: 'test-key' });
     parent.agent.permission.setMode('yolo');
 
     const child = testAgent();
     child.configure({ tools: ['Read'] });
-    // The child was originally spawned with a model that no longer matches the
-    // parent agent's current model (as if the parent ran setModel afterwards).
-    child.agent.config.update({ modelAlias: 'stale-model-from-initial-spawn' });
+    child.configureRuntimeModel({ type: 'kimi', model: 'item-model', apiKey: 'test-key' });
+    child.agent.config.update({ modelAlias: 'item-model' });
     child.agent.useProfile(
       profile({ name: 'explore', tools: ['Read'], systemPrompt: 'explore prompt' }),
     );
@@ -1152,6 +1181,7 @@ describe('SessionSubagentHost', () => {
         homedir: '/tmp/kimi-session/agents/agent-0',
         type: 'sub',
         parentAgentId: 'main',
+        modelBinding: { source: 'agent-swarm-item' },
       },
     });
     const host = new SessionSubagentHost(session, 'main');
@@ -1165,10 +1195,8 @@ describe('SessionSubagentHost', () => {
     });
 
     await handle.completion;
-    // resume must realign the child to the parent agent's current model rather
-    // than leave it on the stale model from its initial spawn.
-    expect(child.agent.config.modelAlias).toBe(parent.agent.config.modelAlias);
-    expect(child.agent.config.modelAlias).not.toBe('stale-model-from-initial-spawn');
+    expect(child.agent.config.modelAlias).toBe('item-model');
+    expect(child.agent.config.modelAlias).not.toBe(parent.agent.config.modelAlias);
   });
 });
 
@@ -1619,6 +1647,7 @@ function fakeSession(
             type: config.type ?? 'main',
             parentAgentId,
             swarmItem: options.swarmItem,
+            modelBinding: options.modelBinding,
           };
         }
         if (options.profile !== undefined) {
@@ -1690,7 +1719,7 @@ function stat(kind: 'dir' | 'file') {
   };
 }
 
-function queuedTask(index: number): QueuedSubagentTask<number> {
+function queuedTask(index: number): SpawnQueuedSubagentTask<number> {
   return {
     kind: 'spawn',
     data: index,

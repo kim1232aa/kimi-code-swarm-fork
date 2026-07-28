@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   type QueuedSubagentTask,
   type RunSubagentOptions,
+  type SpawnQueuedSubagentTask,
   type SpawnSubagentOptions,
   type SubagentHandle,
 } from '../../src/session/subagent-host';
@@ -65,6 +66,35 @@ describe('SubagentBatch scheduling contract', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('forwards an item model binding to the spawned subagent', async () => {
+    const spawn = vi.fn(async (options: SpawnSubagentOptions): Promise<SubagentHandle> => ({
+      agentId: 'agent-1',
+      profileName: options.profileName,
+      resumed: false,
+      completion: Promise.resolve({ result: 'done' }),
+    }));
+    const launcher: SubagentBatchLauncher = {
+      spawn,
+      resume: vi.fn(),
+      retry: vi.fn(),
+    };
+    const binding = {
+      source: 'agent-swarm-item' as const,
+      modelAlias: 'test/item-model',
+      thinkingEffort: 'high' as const,
+    };
+
+    await expect(
+      new SubagentBatch(launcher, [{ ...queuedTask(1), binding }]).run(),
+    ).resolves.toMatchObject([{ agentId: 'agent-1', status: 'completed' }]);
+    expect(spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profileName: 'coder',
+        binding,
+      }),
+    );
   });
 
   it('rate-limit phase starts when the first provider rate limit stops the normal ramp', async () => {
@@ -892,7 +922,7 @@ function isMockRateLimitOutcome<T>(
   return 'type' in outcome && outcome.type === 'rate_limited';
 }
 
-function queuedTask(index: number): QueuedSubagentTask<number> {
+function queuedTask(index: number): SpawnQueuedSubagentTask<number> {
   return {
     kind: 'spawn',
     data: index,

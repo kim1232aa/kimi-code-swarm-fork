@@ -726,6 +726,25 @@ describe('AgentSwarmProgressComponent', () => {
     expect(output).toContain('002 src/b.ts');
   });
 
+  it('shows explicit model aliases for object items throughout the row lifecycle', () => {
+    const component = createComponent({ description: '' });
+
+    component.updateArgs({
+      items: [
+        { item: 'src/a.ts', model_alias: 'provider/model-a' },
+        { item: 'src/b.ts', model_alias: 'provider/model-b' },
+      ],
+    });
+    expect(renderText(component)).toContain('001 src/a.ts · provider/model-a');
+
+    component.registerSubagent({ agentId: 'agent-1', swarmIndex: 1 });
+    component.markInputComplete();
+    expect(renderText(component)).toContain('001 src/a.ts · provider/model-a');
+
+    component.markCompleted('agent-1', 'Reviewed imports');
+    expect(renderText(component, 160)).toContain('✓ [provider/model-a] Reviewed imports');
+  });
+
   it('creates pending rows from resume_agent_ids before streamed args items', () => {
     const component = createComponent({
       description: '',
@@ -771,6 +790,21 @@ describe('AgentSwarmProgressComponent', () => {
 
     expect(output).toContain('001 src/a.ts');
     expect(output).toContain('002 src/b');
+  });
+
+  it('uses one anonymous row while an object item is still streaming', () => {
+    const partial =
+      '{"items":[{"item":"src/a.ts","model_alias":"provider/model-a"},{"item":"src/b';
+    expect(agentSwarmPartialItemsFromArguments(partial)).toEqual(['']);
+
+    const component = createComponent({ description: '' });
+    component.updateArgs({}, { streamingArguments: partial });
+    const output = renderText(component);
+
+    expect(output).toContain('001 Queued...');
+    expect(output).not.toContain('002');
+    expect(output).not.toContain('model_alias');
+    expect(output).not.toContain('provider/model-a');
   });
 
   it('creates pending rows from partial streaming resume_agent_ids', () => {
@@ -838,14 +872,14 @@ describe('AgentSwarmProgressComponent', () => {
     expect(output).not.toContain('123 [');
   });
 
-  it('extracts description and item list from AgentSwarm args', () => {
+  it('extracts description and string or object item values from AgentSwarm args', () => {
     const args = {
       description: 'Review changed files',
-      items: ['src/a.ts', 123],
+      items: ['src/a.ts', 123, { item: 'src/b.ts', model_alias: 'provider/model-b' }],
     };
 
     expect(agentSwarmDescriptionFromArgs(args)).toBe('Review changed files');
-    expect(agentSwarmItemsFromArgs(args)).toEqual(['src/a.ts', '123']);
+    expect(agentSwarmItemsFromArgs(args)).toEqual(['src/a.ts', '123', 'src/b.ts']);
   });
 });
 

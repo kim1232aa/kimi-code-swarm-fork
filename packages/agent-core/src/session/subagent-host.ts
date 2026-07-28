@@ -28,6 +28,7 @@ import {
   type SubagentSuspendedEvent,
   type QueuedSubagentTask,
 } from './subagent-batch';
+import type { SubagentSpawnBinding } from './subagent-binding';
 import SUMMARY_CONTINUATION_PROMPT from './summary-continuation.md?raw';
 
 export const DEFAULT_SUBAGENT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
@@ -121,6 +122,7 @@ export interface RunSubagentOptions {
 export interface SpawnSubagentOptions extends RunSubagentOptions {
   readonly profileName: string;
   readonly swarmItem?: string;
+  readonly binding?: SubagentSpawnBinding;
 }
 
 type SubagentCompletion = {
@@ -156,12 +158,17 @@ export class SessionSubagentHost {
     const profile = this.resolveProfile(parent, options.profileName);
     const { id, agent } = await this.session.createAgent(
       { type: 'sub', generate: parent.rawGenerate },
-      { parentAgentId: this.ownerAgentId, swarmItem: options.swarmItem },
+      {
+        parentAgentId: this.ownerAgentId,
+        swarmItem: options.swarmItem,
+        modelBinding:
+          options.binding === undefined ? undefined : { source: options.binding.source },
+      },
     );
     const completion = this.runWithActiveChild(id, options, async (runOptions) => {
       this.emitSubagentSpawned(parent, id, profile.name, runOptions);
       try {
-        await this.configureChild(parent, agent, profile);
+        await this.configureChild(parent, agent, profile, options.binding);
         return await this.runPromptTurn(parent, id, agent, profile.name, runOptions);
       } catch (error) {
         this.emitSubagentFailed(parent, id, runOptions, error);
@@ -178,11 +185,12 @@ export class SessionSubagentHost {
 
   async resume(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
-    const { parent, child, profileName } = await this.ensureIdleSubagent(agentId);
+    const { parent, child, profileName, preserveModelBinding } =
+      await this.ensureIdleSubagent(agentId);
     const completion = this.runWithActiveChild(agentId, options, async (runOptions) => {
       this.emitSubagentSpawned(parent, agentId, profileName, runOptions);
       try {
-        child.config.update({ modelAlias: parent.config.modelAlias });
+        if (!preserveModelBinding) child.config.update({ modelAlias: parent.config.modelAlias });
         return await this.runPromptTurn(parent, agentId, child, profileName, runOptions);
       } catch (error) {
         this.emitSubagentFailed(parent, agentId, runOptions, error);
@@ -194,11 +202,12 @@ export class SessionSubagentHost {
 
   async retry(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
-    const { parent, child, profileName } = await this.ensureIdleSubagent(agentId);
+    const { parent, child, profileName, preserveModelBinding } =
+      await this.ensureIdleSubagent(agentId);
     const completion = this.runWithActiveChild(agentId, options, async (runOptions) => {
       try {
         runOptions.signal.throwIfAborted();
-        child.config.update({ modelAlias: parent.config.modelAlias });
+        if (!preserveModelBinding) child.config.update({ modelAlias: parent.config.modelAlias });
         this.emitSubagentStarted(parent, agentId);
         const turnId = child.turn.retry('agent-host');
         if (turnId === null) {
@@ -214,9 +223,12 @@ export class SessionSubagentHost {
     return { agentId, profileName, resumed: true, completion };
   }
 
-  private async ensureIdleSubagent(
-    agentId: string,
-  ): Promise<{ readonly parent: Agent; readonly child: Agent; readonly profileName: string }> {
+  private async ensureIdleSubagent(agentId: string): Promise<{
+    readonly parent: Agent;
+    readonly child: Agent;
+    readonly profileName: string;
+    readonly preserveModelBinding: boolean;
+  }> {
     const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
     const metadata = this.session.metadata.agents[agentId];
     if (metadata?.type !== 'sub') {
@@ -231,7 +243,12 @@ export class SessionSubagentHost {
     }
 
     const profileName = child.config.profileName ?? 'subagent';
-    return { parent, child, profileName };
+    return {
+      parent,
+      child,
+      profileName,
+      preserveModelBinding: metadata.modelBinding?.source === 'agent-swarm-item',
+    };
   }
 
   async runQueued<T>(tasks: readonly QueuedSubagentTask<T>[]): Promise<Array<SubagentResult<T>>> {
@@ -400,12 +417,12 @@ export class SessionSubagentHost {
     parent: Agent,
     child: Agent,
     profile: ResolvedAgentProfile,
+    binding?: SubagentSpawnBinding,
   ): Promise<void> {
-    // A subagent always inherits the parent agent's model.
     child.config.update({
       cwd: parent.config.cwd,
-      modelAlias: parent.config.modelAlias,
-      thinkingEffort: parent.config.thinkingEffort,
+      modelAlias: binding?.modelAlias ?? parent.config.modelAlias,
+      thinkingEffort: binding?.thinkingEffort ?? parent.config.thinkingEffort,
     });
 
     const context = await prepareSystemPromptContext(

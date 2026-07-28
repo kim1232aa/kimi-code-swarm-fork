@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => {
     parse,
     createProgram: vi.fn(() => ({ parse })),
     getVersion: vi.fn(() => '0.0.1-alpha.2'),
+    installSwarmRuntimeMetadata: vi.fn(),
     validateOptions: vi.fn(),
     runUpdatePreflight: vi.fn(),
     runShell: vi.fn(),
@@ -107,6 +108,7 @@ vi.mock('../../src/cli/version', async () => {
   return {
     ...actual,
     getVersion: mocks.getVersion,
+    installSwarmRuntimeMetadata: mocks.installSwarmRuntimeMetadata,
   };
 });
 
@@ -349,10 +351,14 @@ describe('main entry command handling', () => {
     expect(runShell).toHaveBeenCalledWith(opts, '0.0.1-alpha.2');
   });
 
-  it('installs crash handlers before parsing CLI arguments', () => {
+  it('installs runtime metadata and crash handlers before parsing CLI arguments', () => {
     main();
 
+    expect(mocks.installSwarmRuntimeMetadata).toHaveBeenCalledWith('0.0.1-alpha.2');
     expect(mocks.installCrashHandlers).toHaveBeenCalledTimes(1);
+    expect(mocks.installSwarmRuntimeMetadata.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.installCrashHandlers.mock.invocationCallOrder[0]!,
+    );
     expect(mocks.installCrashHandlers.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.createProgram.mock.invocationCallOrder[0]!,
     );

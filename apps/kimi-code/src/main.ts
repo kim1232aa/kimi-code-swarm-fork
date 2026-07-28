@@ -33,7 +33,11 @@ import { runPluginNodeEntry } from './cli/sub/plugin-run-node';
 import { handleUpgrade } from './cli/sub/upgrade';
 import { createCliTelemetryBootstrap, initializeCliTelemetry } from './cli/telemetry';
 import { runUpdatePreflight } from './cli/update/preflight';
-import { createKimiCodeHostIdentity, getVersion } from './cli/version';
+import {
+  createKimiCodeHostIdentity,
+  getVersion,
+  installSwarmRuntimeMetadata,
+} from './cli/version';
 import { CLI_SHUTDOWN_TIMEOUT_MS, CLI_UI_MODE, PROCESS_NAME } from './constant/app';
 import { cleanupStaleNativeCacheForCurrent } from './native/native-assets';
 import { installNativeModuleHook } from './native/module-hook';
@@ -136,6 +140,8 @@ const MIGRATE_CLI_OPTIONS: CLIOptions = {
 
 export function main(): void {
   process.title = PROCESS_NAME;
+  const version = getVersion();
+  installSwarmRuntimeMetadata(version);
   installCrashHandlers();
   // Route all outbound fetch through HTTP_PROXY/HTTPS_PROXY (honoring NO_PROXY)
   // before any client is constructed. No-op when no proxy variable is set; an
@@ -152,8 +158,6 @@ export function main(): void {
       // ignore: cache GC must never affect process startup
     }
   });
-
-  const version = getVersion();
 
   const program = createProgram(
     version,

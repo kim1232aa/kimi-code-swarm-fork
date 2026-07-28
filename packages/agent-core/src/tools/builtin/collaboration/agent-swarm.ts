@@ -2,19 +2,40 @@ import { z } from 'zod';
 
 import type { SwarmMode } from '../../../agent/swarm';
 import type { BuiltinTool } from '../../../agent/tool';
+import { ToolAccesses } from '../../../loop/tool-access';
+import type { ExecutableToolContext, ExecutableToolResult, ToolExecution } from '../../../loop/types';
+import {
+  resolveAgentSwarmItemBinding,
+  type AgentSwarmItemBindingRequest,
+  type SubagentSpawnBinding,
+} from '../../../session/subagent-binding';
 import {
   DEFAULT_SUBAGENT_TIMEOUT_MS,
   type QueuedSubagentTask,
   type SessionSubagentHost,
 } from '../../../session/subagent-host';
-import { ToolAccesses } from '../../../loop/tool-access';
-import type { ExecutableToolContext, ExecutableToolResult, ToolExecution } from '../../../loop/types';
+import type { ModelProvider } from '../../../session/provider-manager';
 import { toInputJsonSchema } from '../../support/input-schema';
 import AGENT_SWARM_DESCRIPTION from './agent-swarm.md?raw';
 
 const DEFAULT_SUBAGENT_TYPE = 'coder';
 const PROMPT_TEMPLATE_PLACEHOLDER = '{{item}}';
 const MAX_AGENT_SWARM_SUBAGENTS = 128;
+const AGENT_SWARM_SELECTOR_DESCRIPTION =
+  'Object items may set model_alias and thinking for one new subagent; templates receive only the item text.';
+
+const AgentSwarmItemSchema = z.union([
+  z.string().trim().min(1),
+  z
+    .object({
+      item: z.string().trim().min(1),
+      model_alias: z.string().trim().min(1).optional(),
+      thinking: z.string().trim().min(1).optional(),
+    })
+    .strict(),
+]);
+
+type AgentSwarmItem = z.infer<typeof AgentSwarmItemSchema>;
 
 export const AgentSwarmToolInputSchema = z
   .object({
@@ -40,11 +61,11 @@ export const AgentSwarmToolInputSchema = z
         `Prompt template for each subagent. The ${PROMPT_TEMPLATE_PLACEHOLDER} placeholder is replaced with each item value.`,
       ),
     items: z
-      .array(z.string().trim().min(1))
+      .array(AgentSwarmItemSchema)
       .max(MAX_AGENT_SWARM_SUBAGENTS)
       .optional()
       .describe(
-        `Values used to fill ${PROMPT_TEMPLATE_PLACEHOLDER}. Each item launches one new subagent.`,
+        `Values used to fill ${PROMPT_TEMPLATE_PLACEHOLDER}. Each item launches one new subagent; object items may select a configured model alias and thinking level.`,
       ),
     resume_agent_ids: z
       .record(z.string().trim().min(1), z.string().trim().min(1))
@@ -61,6 +82,7 @@ interface AgentSwarmSpawnSpec {
   readonly kind: 'spawn';
   readonly index: number;
   readonly item: string;
+  readonly binding?: SubagentSpawnBinding;
   readonly prompt: string;
 }
 
@@ -85,7 +107,7 @@ interface SwarmRunResult {
 
 export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
   readonly name = 'AgentSwarm' as const;
-  readonly description = AGENT_SWARM_DESCRIPTION;
+  readonly description = `${AGENT_SWARM_DESCRIPTION}\n\n${AGENT_SWARM_SELECTOR_DESCRIPTION}`;
   readonly parameters: Record<string, unknown> = toInputJsonSchema(AgentSwarmToolInputSchema);
 
   constructor(
@@ -94,6 +116,8 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
     // `0` = no timeout, preserved on purpose (`0 ?? DEFAULT` stays `0`);
     // SubagentBatch arms no timer for non-positive timeouts.
     private readonly subagentTimeoutMs?: number,
+    private readonly modelProvider?: Pick<ModelProvider, 'resolveProviderConfig'>,
+    private readonly getParentModelAlias?: () => string | undefined,
   ) {}
 
   resolveExecution(args: AgentSwarmToolInput): ToolExecution {
@@ -135,7 +159,17 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
     toolCallId: string,
   ): Promise<string> {
     const profileName = normalizeOptionalString(args.subagent_type) ?? DEFAULT_SUBAGENT_TYPE;
-    const specs = createAgentSwarmSpecs(args, (agentId) => this.subagentHost.getSwarmItem(agentId));
+    const specs = createAgentSwarmSpecs(
+      args,
+      (agentId) => this.subagentHost.getSwarmItem(agentId),
+      (request) =>
+        resolveAgentSwarmItemBinding(
+          request,
+          this.getParentModelAlias?.(),
+          this.modelProvider,
+        ),
+      (alias) => isConfiguredModelAlias(alias, this.modelProvider),
+    );
     const tasks = specs.map((spec): QueuedSubagentTask<AgentSwarmSpec> => {
       const descriptionName = spec.kind === 'resume' ? 'resume' : profileName;
       const common = {
@@ -160,6 +194,7 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
       return {
         ...common,
         kind: 'spawn',
+        binding: spec.binding,
       };
     });
     const results = await this.subagentHost.runQueued(tasks);
@@ -170,12 +205,27 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
 function createAgentSwarmSpecs(
   args: AgentSwarmToolInput,
   getResumeItem: (agentId: string) => string | undefined,
+  resolveSelector: (request: AgentSwarmItemBindingRequest) => SubagentSpawnBinding,
+  isConfiguredAlias: (alias: string) => boolean,
 ): AgentSwarmSpec[] {
   const resumeEntries = Object.entries(args.resume_agent_ids ?? {}).map(([agentId, prompt]) => ({
     agentId: agentId.trim(),
     prompt: prompt.trim(),
   }));
-  const items = (args.items ?? []).map((item) => item.trim());
+  const items = (args.items ?? []).map((value) => {
+    const normalized = normalizeAgentSwarmItem(value);
+    if (typeof value === 'string') {
+      const misplacedAlias = findMisplacedModelAlias(normalized.item, isConfiguredAlias);
+      if (misplacedAlias !== undefined) throw misplacedModelAliasError(misplacedAlias);
+    }
+    const hasExplicitBinding =
+      typeof value !== 'string' &&
+      (normalized.modelAlias !== undefined || normalized.thinking !== undefined);
+    return {
+      ...normalized,
+      binding: hasExplicitBinding ? resolveSelector(normalized) : undefined,
+    };
+  });
   const itemCount = items.length;
   const resumeCount = resumeEntries.length;
   const totalCount = resumeCount + itemCount;
@@ -208,7 +258,7 @@ function createAgentSwarmSpecs(
   }
   if (items.length > 0) {
     const itemPromptTemplate = promptTemplate!;
-    items.forEach((item, index) => {
+    items.forEach(({ item, binding }, index) => {
       const prompt = itemPromptTemplate.split(PROMPT_TEMPLATE_PLACEHOLDER).join(item);
       const previousIndex = seenPrompts.get(prompt);
       if (previousIndex !== undefined) {
@@ -221,11 +271,53 @@ function createAgentSwarmSpecs(
         kind: 'spawn',
         index: specs.length + 1,
         item,
+        binding,
         prompt,
       });
     });
   }
   return specs;
+}
+
+function normalizeAgentSwarmItem(
+  value: AgentSwarmItem,
+): AgentSwarmItemBindingRequest & { readonly item: string } {
+  if (typeof value === 'string') return { item: value.trim() };
+  return {
+    item: value.item.trim(),
+    modelAlias: normalizeOptionalString(value.model_alias),
+    thinking: normalizeOptionalString(value.thinking),
+  };
+}
+
+function findMisplacedModelAlias(
+  item: string,
+  isConfiguredAlias: (alias: string) => boolean,
+): string | undefined {
+  for (const candidate of item.match(/[\p{L}\p{N}_.:-]+\/[\p{L}\p{N}_.:/-]+/gu) ?? []) {
+    const alias = candidate.replace(/[.,;:!?，。；：！？、)）\]}]+$/u, '');
+    if (isConfiguredAlias(alias)) return alias;
+  }
+  return undefined;
+}
+
+function isConfiguredModelAlias(
+  alias: string,
+  modelProvider: Pick<ModelProvider, 'resolveProviderConfig'> | undefined,
+): boolean {
+  if (modelProvider === undefined) return false;
+  try {
+    modelProvider.resolveProviderConfig(alias);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function misplacedModelAliasError(alias: string): Error {
+  return new Error(
+    `Model alias "${alias}" was placed inside a string item, but string items do not select models. Use an object item with model_alias: { item: "task", model_alias: "${alias}" }.`,
+  );
 }
 
 function hasMinimumAgentSwarmInputs(itemCount: number, resumeCount: number): boolean {

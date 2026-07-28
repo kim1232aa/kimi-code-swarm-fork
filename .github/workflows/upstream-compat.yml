@@ -1,0 +1,78 @@
+name: Upstream compatibility
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Merge upstream in the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream-check https://github.com/MoonshotAI/kimi-code.git
+          git fetch --no-tags upstream-check main
+          set +e
+          git merge --no-commit --no-ff upstream-check/main
+          merge_status=$?
+          set -e
+
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          unexpected="$(printf '%s\n' "$conflicts" | grep -v '^README.md$' || true)"
+          if [[ -n "$unexpected" ]]; then
+            printf 'Upstream conflicts require maintenance:\n%s\n' "$unexpected" >&2
+            exit 1
+          fi
+          if printf '%s\n' "$conflicts" | grep -qx 'README.md'; then
+            git checkout --ours -- README.md
+            git add README.md
+          fi
+          if [[ -n "$(git diff --name-only --diff-filter=U)" || $merge_status -ne 0 && -z "$conflicts" ]]; then
+            echo 'Upstream merge did not reach a testable state.' >&2
+            exit 1
+          fi
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:packages
+      - run: pnpm --filter @moonshot-ai/agent-core typecheck
+      - run: pnpm --filter @moonshot-ai/agent-core-v2 typecheck
+      - run: pnpm --filter @moonshot-ai/kimi-code typecheck
+      - name: Run fork-focused mock tests
+        run: |
+          pnpm exec vitest run packages/agent-core/test/tools/builtin-current.test.ts packages/agent-core/test/session/subagent-host.test.ts packages/agent-core/test/session/subagent-batch.test.ts
+          pnpm exec vitest run packages/agent-core-v2/test/tool/tool.test.ts packages/agent-core-v2/test/session/swarm/sessionSwarm.test.ts
+          pnpm exec vitest run apps/kimi-code/test/tui/components/messages/agent-swarm-progress.test.ts apps/kimi-code/test/cli/version.test.ts apps/kimi-code/test/cli/main.test.ts
+      - name: Check plugin guard and doctor
+        shell: bash
+        run: |
+          set -euo pipefail
+          hook=plugins/multi-model-swarm/hooks/validate-agent-swarm.mjs
+          blocked="$(printf '%s' '{"toolName":"AgentSwarm","toolInput":{"items":[{"item":"task","model_alias":"provider/model"},"task-2"]}}' | env -u KIMI_CODE_CAPABILITIES node "$hook")"
+          node -e 'const value=JSON.parse(process.argv[1]); if (value.hookSpecificOutput?.permissionDecision !== "deny") process.exit(1)' "$blocked"
+          allowed="$(printf '%s' '{"toolName":"AgentSwarm","toolInput":{"items":["task-1","task-2"]}}' | env -u KIMI_CODE_CAPABILITIES node "$hook")"
+          test -z "$allowed"
+          routed="$(printf '%s' '{"toolName":"AgentSwarm","toolInput":{"items":[{"item":"task","model_alias":"provider/model"},"task-2"]}}' | KIMI_CODE_CAPABILITIES=agent-swarm-item-models-v1 node "$hook")"
+          test -z "$routed"
+          misplaced="$(printf '%s' '{"toolName":"AgentSwarm","toolInput":{"items":["Gemini (provider/model)","task-2"]}}' | KIMI_CODE_CAPABILITIES=agent-swarm-item-models-v1 node "$hook")"
+          node -e 'const value=JSON.parse(process.argv[1]); if (value.hookSpecificOutput?.permissionDecision !== "deny") process.exit(1)' "$misplaced"
+          path_items="$(printf '%s' '{"toolName":"AgentSwarm","toolInput":{"items":["src/a.ts","src/b.ts"]}}' | KIMI_CODE_CAPABILITIES=agent-swarm-item-models-v1 node "$hook")"
+          test -z "$path_items"
+          KIMI_CODE_CAPABILITIES=agent-swarm-item-models-v1 KIMI_CODE_SWARM_VERSION=0.29.2+swarm.1 node plugins/multi-model-swarm/bin/doctor.mjs --json

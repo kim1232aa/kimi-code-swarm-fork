@@ -102,11 +102,16 @@ export interface SessionSkillConfig {
   readonly builtinDir?: string;
 }
 
+export interface AgentModelBindingMeta {
+  readonly source: 'agent-swarm-item';
+}
+
 export interface AgentMeta {
   readonly homedir?: string;
   readonly type: AgentType;
   readonly parentAgentId?: string | null;
   readonly swarmItem?: string;
+  readonly modelBinding?: AgentModelBindingMeta;
 }
 
 interface ResumedAgent {
@@ -120,6 +125,7 @@ export interface CreateAgentOptions {
   readonly profile?: ResolvedAgentProfile;
   readonly parentAgentId?: string;
   readonly swarmItem?: string;
+  readonly modelBinding?: AgentModelBindingMeta;
   readonly persistMetadata?: boolean;
 }
 
@@ -645,6 +651,7 @@ export class Session {
         type,
         parentAgentId,
         swarmItem: options.swarmItem,
+        modelBinding: options.modelBinding,
       };
       void this.writeMetadata();
     }

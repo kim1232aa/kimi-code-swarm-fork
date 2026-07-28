@@ -1110,7 +1110,12 @@ describe('SessionSwarmService metadata compatibility', () => {
     const spawnTask: SessionSwarmSpawnTask = {
       ...spawnSessionTask('src/a.ts'),
       kind: 'spawn',
-      binding: { model: 'provider/secondary', thinking: 'low' },
+      binding: {
+        model: 'provider/secondary',
+        thinking: 'low',
+        strictThinking: true,
+        source: 'agent-swarm-item',
+      },
     };
 
     await expect(
@@ -1126,6 +1131,7 @@ describe('SessionSwarmService metadata compatibility', () => {
           profile: 'coder',
           model: 'provider/secondary',
           thinking: 'low',
+          strictThinking: true,
           cwd: '/repo',
         },
       }),
@@ -1149,6 +1155,31 @@ describe('SessionSwarmService metadata compatibility', () => {
       {
         status: 'failed',
         error: expect.stringContaining('comes from [secondary_model].model / KIMI_SECONDARY_MODEL'),
+      },
+    ]);
+    expect(createAgent).not.toHaveBeenCalled();
+  });
+
+  it('reports an invalid item model without labeling it as the secondary model', async () => {
+    const service = ix.get(ISessionSwarmService);
+    const spawnTask: SessionSwarmSpawnTask = {
+      ...spawnSessionTask('src/a.ts'),
+      kind: 'spawn',
+      binding: {
+        model: 'provider/bad',
+        source: 'agent-swarm-item',
+      },
+    };
+
+    await expect(
+      service.run({
+        callerAgentId: 'main',
+        tasks: [spawnTask],
+      }),
+    ).resolves.toMatchObject([
+      {
+        status: 'failed',
+        error: 'Model "provider/bad" is not configured in config.toml.',
       },
     ]);
     expect(createAgent).not.toHaveBeenCalled();
