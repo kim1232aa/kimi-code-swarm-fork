@@ -199,7 +199,6 @@ export class AgentSwarmTool implements IAgentSwarmTool {
       (agentId) =>
         this.swarmService.getSwarmItem({ callerAgentId: this.callerAgentId, agentId }),
       (item) => this.resolveItemBinding(item, binding),
-      (alias) => this.isConfiguredModelAlias(alias),
     );
     const tasks: SessionSwarmTask<AgentSwarmSpec>[] = specs.map((spec) => {
       const descriptionName = spec.kind === 'resume' ? 'resume' : profileName;
@@ -288,15 +287,6 @@ export class AgentSwarmTool implements IAgentSwarmTool {
     }
   }
 
-  private isConfiguredModelAlias(alias: string): boolean {
-    try {
-      this.tryGetModel(alias);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   private modelNotFound(alias: string): Error {
     return new Error(`Model "${alias}" is not configured in config.toml.`);
   }
@@ -308,7 +298,6 @@ async function createAgentSwarmSpecs(
   args: AgentSwarmToolInput,
   getResumeItem: (agentId: string) => Promise<string | undefined>,
   resolveItemBinding: (item: NormalizedAgentSwarmItem) => SessionSwarmBinding | undefined,
-  isConfiguredAlias: (alias: string) => boolean,
 ): Promise<AgentSwarmSpec[]> {
   const resumeEntries = Object.entries(args.resume_agent_ids ?? {}).map(([agentId, prompt]) => ({
     agentId: agentId.trim(),
@@ -316,10 +305,6 @@ async function createAgentSwarmSpecs(
   }));
   const items = (args.items ?? []).map((value) => {
     const item = normalizeAgentSwarmItem(value);
-    if (typeof value === 'string') {
-      const misplacedAlias = findMisplacedModelAlias(item.item, isConfiguredAlias);
-      if (misplacedAlias !== undefined) throw misplacedModelAliasError(misplacedAlias);
-    }
     return { ...item, binding: resolveItemBinding(item) };
   });
   const itemCount = items.length;
@@ -387,23 +372,6 @@ function normalizeAgentSwarmItem(value: AgentSwarmItem): NormalizedAgentSwarmIte
     thinking,
     hasExplicitBinding: modelAlias !== undefined || thinking !== undefined,
   };
-}
-
-function findMisplacedModelAlias(
-  item: string,
-  isConfiguredAlias: (alias: string) => boolean,
-): string | undefined {
-  for (const candidate of item.match(/[\p{L}\p{N}_.:-]+\/[\p{L}\p{N}_.:/-]+/gu) ?? []) {
-    const alias = candidate.replace(/[.,;:!?，。；：！？、)）\]}]+$/u, '');
-    if (isConfiguredAlias(alias)) return alias;
-  }
-  return undefined;
-}
-
-function misplacedModelAliasError(alias: string): Error {
-  return new Error(
-    `Model alias "${alias}" was placed inside a string item, but string items do not select models. Use an object item with model_alias: { item: "task", model_alias: "${alias}" }.`,
-  );
 }
 
 function supportedThinkingEfforts(model: Model): string {

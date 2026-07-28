@@ -10,4 +10,4 @@ If parsing fails, explain this usage and do not call tools:
 
 Reject empty aliases, empty tasks, duplicate resulting task prompts, and more than 128 sections. If more than 8 distinct aliases are requested, ask the user to confirm before continuing.
 
-Call `AgentSwarm` once, as the only tool call in that response. Use `prompt_template: "{{item}}"`; convert each section to an object item with `item`, `model_alias`, and optional `thinking`. State that routing has no fallback: an invalid alias or thinking level must fail rather than silently use another model.
+Call `AgentSwarm` once, as the only tool call in that response. Include a non-empty `description`, use `prompt_template: "{{item}}"`, and convert each section to an object item with `item`, `model_alias`, and optional `thinking`. State that routing has no fallback: an invalid alias or thinking level must fail rather than silently use another model.

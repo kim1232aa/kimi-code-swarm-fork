@@ -511,19 +511,20 @@ describe('current builtin collaboration tools', () => {
     expect(result.isError).toBeUndefined();
   });
 
-  it('AgentSwarm rejects configured model aliases embedded in string items', async () => {
-    const runQueued = vi.fn();
-    const modelProvider = {
-      resolveProviderConfig: vi.fn((alias: string) => {
-        if (alias !== 'provider/model-a') throw new Error('not configured');
-        return mockResolvedRuntimeProvider(alias);
-      }),
-    };
+  it('AgentSwarm lets string task prose mention a model alias without changing inheritance', async () => {
+    const runQueued = vi.fn(async <T>(tasks: readonly QueuedSubagentTask<T>[]) =>
+      tasks.map((task, index) => ({
+        task,
+        agentId: `agent-${String(index + 1)}`,
+        status: 'completed' as const,
+        result: 'done',
+      })),
+    );
     const tool = new AgentSwarmTool(
       mockSubagentHost({ runQueued: runQueued as unknown as SessionSubagentHost['runQueued'] }),
       mockSwarmMode(),
       undefined,
-      modelProvider,
+      undefined,
       () => 'parent-model',
     );
 
@@ -531,18 +532,18 @@ describe('current builtin collaboration tools', () => {
       tool,
       context({
         description: 'Compare models',
-        prompt_template: 'Review with {{item}}',
-        items: ['Gemini（provider/model-a）', 'ordinary task'],
+        prompt_template: 'Review {{item}}',
+        items: ['Check whether the docs mention provider/model-a', 'ordinary task'],
       }),
     );
+    const tasks = runQueued.mock.calls[0]?.[0] as readonly QueuedSubagentTask[];
 
-    expect(result).toMatchObject({
-      isError: true,
-      output: expect.stringContaining(
-        'string items do not select models. Use an object item with model_alias',
-      ),
+    expect(tasks[0]).toMatchObject({
+      prompt: 'Review Check whether the docs mention provider/model-a',
+      binding: undefined,
     });
-    expect(runQueued).not.toHaveBeenCalled();
+    expect(tasks[1]).toHaveProperty('binding', undefined);
+    expect(result.isError).toBeUndefined();
   });
 
   it('AgentSwarm uses the selected model default thinking when omitted', async () => {

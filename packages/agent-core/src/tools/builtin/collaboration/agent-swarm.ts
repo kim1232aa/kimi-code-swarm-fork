@@ -168,7 +168,6 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
           this.getParentModelAlias?.(),
           this.modelProvider,
         ),
-      (alias) => isConfiguredModelAlias(alias, this.modelProvider),
     );
     const tasks = specs.map((spec): QueuedSubagentTask<AgentSwarmSpec> => {
       const descriptionName = spec.kind === 'resume' ? 'resume' : profileName;
@@ -206,7 +205,6 @@ function createAgentSwarmSpecs(
   args: AgentSwarmToolInput,
   getResumeItem: (agentId: string) => string | undefined,
   resolveSelector: (request: AgentSwarmItemBindingRequest) => SubagentSpawnBinding,
-  isConfiguredAlias: (alias: string) => boolean,
 ): AgentSwarmSpec[] {
   const resumeEntries = Object.entries(args.resume_agent_ids ?? {}).map(([agentId, prompt]) => ({
     agentId: agentId.trim(),
@@ -214,10 +212,6 @@ function createAgentSwarmSpecs(
   }));
   const items = (args.items ?? []).map((value) => {
     const normalized = normalizeAgentSwarmItem(value);
-    if (typeof value === 'string') {
-      const misplacedAlias = findMisplacedModelAlias(normalized.item, isConfiguredAlias);
-      if (misplacedAlias !== undefined) throw misplacedModelAliasError(misplacedAlias);
-    }
     const hasExplicitBinding =
       typeof value !== 'string' &&
       (normalized.modelAlias !== undefined || normalized.thinking !== undefined);
@@ -288,36 +282,6 @@ function normalizeAgentSwarmItem(
     modelAlias: normalizeOptionalString(value.model_alias),
     thinking: normalizeOptionalString(value.thinking),
   };
-}
-
-function findMisplacedModelAlias(
-  item: string,
-  isConfiguredAlias: (alias: string) => boolean,
-): string | undefined {
-  for (const candidate of item.match(/[\p{L}\p{N}_.:-]+\/[\p{L}\p{N}_.:/-]+/gu) ?? []) {
-    const alias = candidate.replace(/[.,;:!?，。；：！？、)）\]}]+$/u, '');
-    if (isConfiguredAlias(alias)) return alias;
-  }
-  return undefined;
-}
-
-function isConfiguredModelAlias(
-  alias: string,
-  modelProvider: Pick<ModelProvider, 'resolveProviderConfig'> | undefined,
-): boolean {
-  if (modelProvider === undefined) return false;
-  try {
-    modelProvider.resolveProviderConfig(alias);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function misplacedModelAliasError(alias: string): Error {
-  return new Error(
-    `Model alias "${alias}" was placed inside a string item, but string items do not select models. Use an object item with model_alias: { item: "task", model_alias: "${alias}" }.`,
-  );
 }
 
 function hasMinimumAgentSwarmInputs(itemCount: number, resumeCount: number): boolean {

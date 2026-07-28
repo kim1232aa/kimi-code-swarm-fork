@@ -51,7 +51,7 @@ Routing precedence in the v2 engine is:
 
 There is no alias or thinking fallback. An unknown alias or unsupported explicit thinking level fails with an error instead of silently switching models. Resumed subagents keep their recorded model.
 
-String items never select a model. Writing `provider/model-a` inside string item text only looks like routing; this fork rejects configured aliases in string items so the child cannot silently inherit another model. Use the object form shown above.
+String items never select a model; they retain the normal profile, configured secondary-model, or caller-model inheritance. Mentioning `provider/model-a` in ordinary task prose does not route to it. Use the object form shown above whenever model selection matters.
 
 Each child starts with its own context. Put relevant paths, constraints, known facts, and expected output in the task text; the child does not automatically receive the parent conversation.
 
@@ -68,7 +68,7 @@ Then run `/reload` or start a new session. The plugin adds:
 - `/multi-model-swarm:run` — parse several `alias::task` sections and issue one routed swarm.
 - `/multi-model-swarm:doctor` — check the fork capability and version without reading model configuration or making network calls.
 - `/multi-model-swarm:smoke` — after explicit confirmation, make exactly two real model calls.
-- A `PreToolUse` guard that blocks object items when the running CLI lacks `agent-swarm-item-models-v1`; string items remain compatible.
+- A `PreToolUse` guard that blocks object items when the running CLI lacks `agent-swarm-item-models-v1`, and rejects incomplete item calls before any child starts (missing `prompt_template`, missing `{{item}}`, empty tasks, or duplicate expanded prompts). It does not silently add missing fields.
 
 Example:
 
