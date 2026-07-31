@@ -34,6 +34,23 @@ KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=1 KIMI_CODE_NO_AUTO_UPDATE=1 node "$HOME/
 
 `KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=1` enables the upstream experimental secondary-model binding used by `Agent` and `AgentSwarm`. `KIMI_CODE_NO_AUTO_UPDATE=1` prevents the official updater from replacing or bypassing this source build.
 
+### Do not use the old launch command
+
+This obsolete command is wrong and must not be copied:
+
+```bash
+Node "$HOME/kimi-code-swarm-fork/apps/kimi-code/dist/main.mjs" --skills-dir "$HOME/kimi-code-swarm-fork/.agents/skills" -m YOUR_MAIN_MODEL_ALIAS
+```
+
+Use the Quick start command above instead. The old command has four separate problems:
+
+- Linux command names are case-sensitive: use `node`, not `Node`.
+- This repository is cloned to `$HOME/kimi-code-multimodel-swarm`, not `$HOME/kimi-code-swarm-fork`.
+- `YOUR_MAIN_MODEL_ALIAS` is placeholder text, not a runnable model alias. Replace it with an exact configured alias, or omit `-m` to use `default_model`.
+- Do not add `--skills-dir` for normal use. That option replaces Kimi Code's automatically discovered user and project Skill directories for the process; it does not append one directory. The fork does not require it, and the optional plugin is installed through `/plugins install` as documented below.
+
+If you intentionally need additional Skill directories, prefer the documented `extra_skill_dirs` configuration so normal Skill discovery remains available. Use `--skills-dir` only when replacing discovery for one launch is specifically intended.
+
 ### Configure the secondary model
 
 Add a configured model alias to `~/.kimi-code/config.toml`:
