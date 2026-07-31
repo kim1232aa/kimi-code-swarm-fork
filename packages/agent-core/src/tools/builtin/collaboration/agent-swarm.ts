@@ -50,9 +50,10 @@ export const AgentSwarmToolInputSchema = z
       ),
     model: z
       .enum(['primary', 'secondary'])
+      .nullable()
       .optional()
       .describe(
-        'Model for every new subagent spawned from items: "secondary" uses the configured secondary model (the default when one is set), "primary" uses the model you are running on. Resumed subagents keep their bound model.',
+        'Model for every new subagent spawned from items: "secondary" uses the configured secondary model (the default when one is set), "primary" uses the model you are running on. Resumed subagents keep their bound model. Omit this field, or use null, when no explicit choice is needed; null is treated the same as omitted.',
       ),
     prompt_template: z
       .string()
@@ -165,13 +166,14 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
     toolCallId: string,
   ): Promise<string> {
     const profileName = normalizeOptionalString(args.subagent_type) ?? DEFAULT_SUBAGENT_TYPE;
+    const modelChoice = args.model ?? undefined;
     const specs = await createAgentSwarmSpecs(
       args,
       (agentId) => this.subagentHost.getSwarmItem(agentId),
       (item) =>
         this.subagentHost.prepareSpawnBinding({
           profileName,
-          modelChoice: args.model,
+          modelChoice,
           item,
         }),
     );
@@ -188,7 +190,7 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
         swarmItem: spec.item,
         signal,
         timeout: this.subagentTimeoutMs ?? DEFAULT_SUBAGENT_TIMEOUT_MS,
-        modelChoice: args.model,
+        modelChoice,
       };
       if (spec.kind === 'resume') {
         return {

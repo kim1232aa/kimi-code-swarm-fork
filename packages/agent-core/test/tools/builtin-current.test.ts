@@ -20,6 +20,7 @@ import {
   type SessionSubagentHost,
 } from '../../src/session/subagent-host';
 import { SessionSkillRegistry } from '../../src/skill';
+import { compileToolArgsValidator, validateToolArgs } from '../../src/tools/args-validator';
 import { TaskListInputSchema } from '../../src/tools/background/task-list';
 import { TaskOutputInputSchema } from '../../src/tools/background/task-output';
 import { TaskStopInputSchema } from '../../src/tools/background/task-stop';
@@ -368,9 +369,12 @@ describe('current builtin collaboration tools', () => {
       prompt_template: 'Review {{item}}',
       items: ['src/a.ts', 'src/b.ts'],
       subagent_type: 'explore',
+      model: null,
     };
 
     expect(AgentSwarmToolInputSchema.safeParse(input).success).toBe(true);
+    const validator = compileToolArgsValidator(tool.parameters);
+    expect(validateToolArgs(validator, input)).toBeNull();
     expect(
       AgentSwarmToolInputSchema.safeParse({
         ...input,
