@@ -164,10 +164,12 @@ export class SessionSwarmService implements ISessionSwarmService {
           profile: profile.name,
           model: binding.model,
           thinking: binding.thinking,
+          strictThinking: binding.strictThinking,
         },
         labels: subagentLabels(callerAgentId, { swarmItem: options.swarmItem }),
       });
     } catch (error) {
+      if (options.binding?.source === 'agent-swarm-item') throw error;
       throw wrapSubagentModelError(error, binding.model, callerData.modelAlias);
     }
     child.accessor

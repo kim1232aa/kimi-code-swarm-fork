@@ -9,12 +9,29 @@ import {
 } from '../../../session/subagent-host';
 import { ToolAccesses } from '../../../loop/tool-access';
 import type { ExecutableToolContext, ExecutableToolResult, ToolExecution } from '../../../loop/types';
+import {
+  type AgentSwarmItemBindingRequest,
+  type SubagentSpawnBinding,
+} from '../../../session/subagent-binding';
 import { toInputJsonSchema } from '../../support/input-schema';
 import AGENT_SWARM_DESCRIPTION from './agent-swarm.md?raw';
 
 const DEFAULT_SUBAGENT_TYPE = 'coder';
 const PROMPT_TEMPLATE_PLACEHOLDER = '{{item}}';
 const MAX_AGENT_SWARM_SUBAGENTS = 128;
+
+const AgentSwarmItemSchema = z.union([
+  z.string().trim().min(1),
+  z
+    .object({
+      item: z.string().trim().min(1),
+      model_alias: z.string().trim().min(1).optional(),
+      thinking: z.string().trim().min(1).optional(),
+    })
+    .strict(),
+]);
+
+type AgentSwarmItem = z.infer<typeof AgentSwarmItemSchema>;
 
 export const AgentSwarmToolInputSchema = z
   .object({
@@ -46,11 +63,11 @@ export const AgentSwarmToolInputSchema = z
         `Prompt template for each subagent. The ${PROMPT_TEMPLATE_PLACEHOLDER} placeholder is replaced with each item value.`,
       ),
     items: z
-      .array(z.string().trim().min(1))
+      .array(AgentSwarmItemSchema)
       .max(MAX_AGENT_SWARM_SUBAGENTS)
       .optional()
       .describe(
-        `Values used to fill ${PROMPT_TEMPLATE_PLACEHOLDER}. Each item launches one new subagent.`,
+        `Values used to fill ${PROMPT_TEMPLATE_PLACEHOLDER}. Each item launches one new subagent. Object items may set an exact configured model_alias and thinking level for that item; strings keep the normal top-level model, profile, secondary-model, or caller binding.`,
       ),
     resume_agent_ids: z
       .record(z.string().trim().min(1), z.string().trim().min(1))
@@ -67,6 +84,7 @@ interface AgentSwarmSpawnSpec {
   readonly kind: 'spawn';
   readonly index: number;
   readonly item: string;
+  readonly binding?: SubagentSpawnBinding;
   readonly prompt: string;
 }
 
@@ -147,7 +165,16 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
     toolCallId: string,
   ): Promise<string> {
     const profileName = normalizeOptionalString(args.subagent_type) ?? DEFAULT_SUBAGENT_TYPE;
-    const specs = createAgentSwarmSpecs(args, (agentId) => this.subagentHost.getSwarmItem(agentId));
+    const specs = await createAgentSwarmSpecs(
+      args,
+      (agentId) => this.subagentHost.getSwarmItem(agentId),
+      (item) =>
+        this.subagentHost.prepareSpawnBinding({
+          profileName,
+          modelChoice: args.model,
+          item,
+        }),
+    );
     const tasks = specs.map((spec): QueuedSubagentTask<AgentSwarmSpec> => {
       const descriptionName = spec.kind === 'resume' ? 'resume' : profileName;
       const common = {
@@ -173,6 +200,7 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
       return {
         ...common,
         kind: 'spawn',
+        binding: spec.binding,
       };
     });
     const results = await this.subagentHost.runQueued(tasks);
@@ -180,15 +208,24 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
   }
 }
 
-function createAgentSwarmSpecs(
+async function createAgentSwarmSpecs(
   args: AgentSwarmToolInput,
   getResumeItem: (agentId: string) => string | undefined,
-): AgentSwarmSpec[] {
+  resolveSelector: (request: AgentSwarmItemBindingRequest) => Promise<SubagentSpawnBinding>,
+): Promise<AgentSwarmSpec[]> {
   const resumeEntries = Object.entries(args.resume_agent_ids ?? {}).map(([agentId, prompt]) => ({
     agentId: agentId.trim(),
     prompt: prompt.trim(),
   }));
-  const items = (args.items ?? []).map((item) => item.trim());
+  const items = (args.items ?? []).map((value) => {
+    const normalized = normalizeAgentSwarmItem(value);
+    return {
+      ...normalized,
+      hasExplicitBinding:
+        typeof value !== 'string' &&
+        (normalized.modelAlias !== undefined || normalized.thinking !== undefined),
+    };
+  });
   const itemCount = items.length;
   const resumeCount = resumeEntries.length;
   const totalCount = resumeCount + itemCount;
@@ -209,36 +246,58 @@ function createAgentSwarmSpecs(
   }
 
   const seenPrompts = new Map<string, number>();
-  const specs: AgentSwarmSpec[] = [];
-  for (const entry of resumeEntries) {
+  const itemPromptTemplate = promptTemplate ?? '';
+  const itemPrompts = items.map(({ item }, index) => {
+    const prompt = itemPromptTemplate.split(PROMPT_TEMPLATE_PLACEHOLDER).join(item);
+    const previousIndex = seenPrompts.get(prompt);
+    if (previousIndex !== undefined) {
+      throw new Error(
+        `Duplicate subagent prompts from items ${String(previousIndex)} and ${String(index + 1)}. AgentSwarm requires distinct subagents.`,
+      );
+    }
+    seenPrompts.set(prompt, index + 1);
+    return prompt;
+  });
+
+  // Resolve every explicit item selector before constructing the queued batch.
+  // Provider lookup and thinking validation may run concurrently, but no child
+  // can be created until all promises have fulfilled and runQueued() is called.
+  const bindings = await Promise.all(
+    items.map(({ modelAlias, thinking, hasExplicitBinding }) =>
+      hasExplicitBinding
+        ? resolveSelector({ modelAlias, thinking })
+        : Promise.resolve(undefined),
+    ),
+  );
+
+  const specs: AgentSwarmSpec[] = resumeEntries.map((entry, index) => ({
+    kind: 'resume',
+    index: index + 1,
+    agentId: entry.agentId,
+    item: getResumeItem(entry.agentId),
+    prompt: entry.prompt,
+  }));
+  items.forEach(({ item }, index) => {
     specs.push({
-      kind: 'resume',
+      kind: 'spawn',
       index: specs.length + 1,
-      agentId: entry.agentId,
-      item: getResumeItem(entry.agentId),
-      prompt: entry.prompt,
+      item,
+      binding: bindings[index],
+      prompt: itemPrompts[index]!,
     });
-  }
-  if (items.length > 0) {
-    const itemPromptTemplate = promptTemplate!;
-    items.forEach((item, index) => {
-      const prompt = itemPromptTemplate.split(PROMPT_TEMPLATE_PLACEHOLDER).join(item);
-      const previousIndex = seenPrompts.get(prompt);
-      if (previousIndex !== undefined) {
-        throw new Error(
-          `Duplicate subagent prompts from items ${String(previousIndex)} and ${String(index + 1)}. AgentSwarm requires distinct subagents.`,
-        );
-      }
-      seenPrompts.set(prompt, index + 1);
-      specs.push({
-        kind: 'spawn',
-        index: specs.length + 1,
-        item,
-        prompt,
-      });
-    });
-  }
+  });
   return specs;
+}
+
+function normalizeAgentSwarmItem(
+  value: AgentSwarmItem,
+): AgentSwarmItemBindingRequest & { readonly item: string } {
+  if (typeof value === 'string') return { item: value.trim() };
+  return {
+    item: value.item.trim(),
+    modelAlias: normalizeOptionalString(value.model_alias),
+    thinking: normalizeOptionalString(value.thinking),
+  };
 }
 
 function hasMinimumAgentSwarmInputs(itemCount: number, resumeCount: number): boolean {

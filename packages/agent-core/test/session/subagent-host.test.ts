@@ -1073,6 +1073,122 @@ describe('SessionSubagentHost', () => {
     );
   });
 
+  it('runQueued applies an item binding and persists its source marker', async () => {
+    const parent = testAgent();
+    parent.configure();
+    parent.newEvents();
+
+    const child = testAgent({ type: 'sub' });
+    child.configure();
+    child.configureRuntimeModel(
+      { type: 'kimi', model: 'item-model', apiKey: 'test-key' },
+      {
+        image_in: false,
+        video_in: false,
+        audio_in: false,
+        tool_use: true,
+        max_context_tokens: 1_000_000,
+        thinking: true,
+      },
+    );
+    const summary =
+      'Completed the queued swarm item and returned a detailed technical handoff so the parent can map the result back to the original swarm input. '.repeat(
+        2,
+      );
+    child.mockNextResponse({ type: 'text', text: summary });
+
+    const metadataAgents: Session['metadata']['agents'] = {};
+    const session = fakeSession(parent.agent, child.agent, metadataAgents);
+    const host = new SessionSubagentHost(session, 'main');
+
+    await expect(
+      host.runQueued([
+        {
+          kind: 'spawn' as const,
+          data: 1,
+          profileName: 'coder',
+          parentToolCallId: 'call_swarm',
+          prompt: 'Review item-1',
+          description: 'Review #1',
+          swarmIndex: 1,
+          swarmItem: 'src/a.ts',
+          runInBackground: false,
+          binding: {
+            source: 'agent-swarm-item' as const,
+            modelAlias: 'item-model',
+            thinkingEffort: 'on' as const,
+          },
+          signal,
+        },
+      ]),
+    ).resolves.toMatchObject([
+      {
+        agentId: 'agent-0',
+        status: 'completed',
+        result: summary.trim(),
+      },
+    ]);
+
+    expect(session.createAgent).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        parentAgentId: 'main',
+        swarmItem: 'src/a.ts',
+        modelBinding: { source: 'agent-swarm-item' },
+      }),
+    );
+    expect(metadataAgents['agent-0']).toMatchObject({
+      type: 'sub',
+      parentAgentId: 'main',
+      swarmItem: 'src/a.ts',
+      modelBinding: { source: 'agent-swarm-item' },
+    });
+    expect(child.agent.config.modelAlias).toBe('item-model');
+    expect(child.agent.config.thinkingEffort).toBe('on');
+  });
+
+  it('preserves an item-bound subagent model when it resumes', async () => {
+    const parent = testAgent();
+    parent.configure();
+    parent.configureRuntimeModel({ type: 'kimi', model: 'parent-model', apiKey: 'test-key' });
+    parent.agent.permission.setMode('yolo');
+
+    const child = testAgent();
+    child.configure({ tools: ['Read'] });
+    child.configureRuntimeModel({ type: 'kimi', model: 'item-model', apiKey: 'test-key' });
+    child.agent.config.update({ modelAlias: 'item-model' });
+    child.agent.useProfile(
+      profile({ name: 'coder', tools: ['Read'], systemPrompt: 'coder prompt' }),
+    );
+    child.agent.context.appendUserMessage([{ type: 'text', text: 'Earlier context' }]);
+    child.mockNextResponse({
+      type: 'text',
+      text: 'Resumed the subagent from its earlier context and carried the task through to completion, then reported a full and detailed technical summary so the parent agent can continue without repeating prior work.',
+    });
+
+    const session = fakeSession(parent.agent, child.agent, {
+      'agent-0': {
+        homedir: '/tmp/kimi-session/agents/agent-0',
+        type: 'sub',
+        parentAgentId: 'main',
+        modelBinding: { source: 'agent-swarm-item' },
+      },
+    });
+    const host = new SessionSubagentHost(session, 'main');
+
+    const handle = await host.resume('agent-0', {
+      parentToolCallId: 'call_agent',
+      prompt: 'Continue from context',
+      description: 'Continue work',
+      runInBackground: false,
+      signal,
+    });
+
+    await handle.completion;
+    expect(child.agent.config.modelAlias).toBe('item-model');
+    expect(child.agent.config.modelAlias).not.toBe(parent.agent.config.modelAlias);
+  });
+
   it('retries a rate-limited child turn without appending the original prompt again', async () => {
     const parent = testAgent();
     parent.configure();
@@ -1403,6 +1519,123 @@ describe('SessionSubagentHost', () => {
       // With the experiment on, resume no longer realigns the child to the
       // parent's model: the subagent keeps the model it was bound to at spawn.
       expect(child.agent.config.modelAlias).toBe('cheap-model');
+    });
+
+    it('lets an explicit item alias override the secondary model during preflight', async () => {
+      const config: KimiConfig = {
+        providers: { 'test-provider': { type: 'kimi', apiKey: 'test-key' } },
+        models: {
+          'cheap-model': {
+            provider: 'test-provider',
+            model: 'cheap-model',
+            maxContextSize: 1_000_000,
+          },
+          'item-model': {
+            provider: 'test-provider',
+            model: 'item-model',
+            maxContextSize: 1_000_000,
+          },
+        },
+        secondaryModel: { model: 'cheap-model' },
+      };
+      const parent = testAgent();
+      parent.configure();
+      const child = testAgent();
+      child.configure();
+      const session = fakeSession(parent.agent, child.agent, {}, {
+        experimentalFlags: secondaryFlags(),
+        config,
+        providerManager: new ProviderManager({ config }),
+      });
+      const host = new SessionSubagentHost(session, 'main');
+
+      await expect(
+        host.prepareSpawnBinding({
+          profileName: 'coder',
+          modelChoice: 'secondary',
+          item: { modelAlias: 'item-model' },
+        }),
+      ).resolves.toEqual({
+        source: 'agent-swarm-item',
+        modelAlias: 'item-model',
+        thinkingEffort: 'off',
+      });
+    });
+
+    it('applies a thinking-only item to the secondary baseline model', async () => {
+      const config: KimiConfig = {
+        providers: { 'test-provider': { type: 'kimi', apiKey: 'test-key' } },
+        models: {
+          'cheap-model': {
+            provider: 'test-provider',
+            model: 'cheap-model',
+            maxContextSize: 1_000_000,
+            capabilities: ['thinking'],
+            supportEfforts: ['medium', 'high'],
+            defaultEffort: 'medium',
+          },
+        },
+        secondaryModel: { model: 'cheap-model' },
+      };
+      const parent = testAgent();
+      parent.configure();
+      const child = testAgent();
+      child.configure();
+      const session = fakeSession(parent.agent, child.agent, {}, {
+        experimentalFlags: secondaryFlags(),
+        config,
+        providerManager: new ProviderManager({ config }),
+      });
+      const host = new SessionSubagentHost(session, 'main');
+
+      await expect(
+        host.prepareSpawnBinding({
+          profileName: 'coder',
+          modelChoice: 'secondary',
+          item: { thinking: 'high' },
+        }),
+      ).resolves.toEqual({
+        source: 'agent-swarm-item',
+        modelAlias: 'cheap-model',
+        thinkingEffort: 'high',
+      });
+    });
+
+    it('rejects unsupported item thinking during preflight', async () => {
+      const config: KimiConfig = {
+        providers: { 'test-provider': { type: 'kimi', apiKey: 'test-key' } },
+        models: {
+          'cheap-model': {
+            provider: 'test-provider',
+            model: 'cheap-model',
+            maxContextSize: 1_000_000,
+            capabilities: ['thinking'],
+            supportEfforts: ['medium', 'high'],
+            defaultEffort: 'medium',
+          },
+        },
+        secondaryModel: { model: 'cheap-model' },
+      };
+      const parent = testAgent();
+      parent.configure();
+      const child = testAgent();
+      child.configure();
+      const session = fakeSession(parent.agent, child.agent, {}, {
+        experimentalFlags: secondaryFlags(),
+        config,
+        providerManager: new ProviderManager({ config }),
+      });
+      const host = new SessionSubagentHost(session, 'main');
+
+      await expect(
+        host.prepareSpawnBinding({
+          profileName: 'coder',
+          modelChoice: 'secondary',
+          item: { thinking: 'low' },
+        }),
+      ).rejects.toThrow(
+        'Thinking effort "low" is not supported by model alias "cheap-model". Supported efforts: off, medium, high.',
+      );
     });
   });
 });
@@ -1878,6 +2111,7 @@ function fakeSession(
             type: config.type ?? 'main',
             parentAgentId,
             swarmItem: options.swarmItem,
+            modelBinding: options.modelBinding,
           };
         }
         if (options.profile !== undefined) {

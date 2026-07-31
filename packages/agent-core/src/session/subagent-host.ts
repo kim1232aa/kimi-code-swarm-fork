@@ -21,10 +21,13 @@ import {
 import { collectGitContext } from './git-context';
 import type { Session } from './index';
 import {
+  resolveAgentSwarmItemBinding,
   resolveSubagentBinding,
   wrapSubagentModelError,
+  type AgentSwarmItemBindingRequest,
   type SubagentModelBinding,
   type SubagentModelChoice,
+  type SubagentSpawnBinding,
 } from './subagent-binding';
 import {
   SubagentBatch,
@@ -128,10 +131,17 @@ export interface SpawnSubagentOptions extends RunSubagentOptions {
   readonly swarmItem?: string;
   /**
    * Explicit per-spawn model choice from the tool call. The profile's own
-   * `modelPreference` applies when this is omitted; both only take effect
-   * with the `secondary-model` experiment enabled.
+   * `modelPreference` applies when this is omitted.
    */
   readonly modelChoice?: SubagentModelChoice;
+  /** Fully resolved AgentSwarm item override produced by prepareSpawnBinding. */
+  readonly binding?: SubagentSpawnBinding;
+}
+
+export interface PrepareSubagentSpawnBindingOptions {
+  readonly profileName: string;
+  readonly modelChoice?: SubagentModelChoice;
+  readonly item: AgentSwarmItemBindingRequest;
 }
 
 type SubagentCompletion = {
@@ -163,19 +173,43 @@ export class SessionSubagentHost {
     private readonly getOwnerAgent?: OwnerAgentResolver,
   ) {}
 
+  /** Resolve one AgentSwarm item selector without creating or starting a child. */
+  async prepareSpawnBinding(
+    options: PrepareSubagentSpawnBindingOptions,
+  ): Promise<SubagentSpawnBinding> {
+    const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
+    const profile = this.resolveProfile(parent, options.profileName);
+    const baseline = this.resolveSpawnBinding(parent, profile, options.modelChoice, false);
+    return resolveAgentSwarmItemBinding(options.item, baseline, (modelAlias) =>
+      this.requireSpawnProvider(
+        parent,
+        modelAlias,
+        parent.config.modelAlias,
+        options.item.modelAlias === undefined,
+      ),
+    );
+  }
+
   async spawn(options: SpawnSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
 
     const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
     const profile = this.resolveProfile(parent, options.profileName);
+    const binding =
+      options.binding ?? this.resolveSpawnBinding(parent, profile, options.modelChoice, true);
     const { id, agent } = await this.session.createAgent(
       { type: 'sub', generate: parent.rawGenerate },
-      { parentAgentId: this.ownerAgentId, swarmItem: options.swarmItem },
+      {
+        parentAgentId: this.ownerAgentId,
+        swarmItem: options.swarmItem,
+        modelBinding:
+          options.binding === undefined ? undefined : { source: options.binding.source },
+      },
     );
     const completion = this.runWithActiveChild(id, options, async (runOptions) => {
       this.emitSubagentSpawned(parent, id, profile.name, runOptions);
       try {
-        await this.configureChild(parent, agent, profile, options.modelChoice);
+        await this.configureChild(parent, agent, profile, binding);
         return await this.runPromptTurn(parent, id, agent, profile.name, runOptions);
       } catch (error) {
         this.emitSubagentFailed(parent, id, runOptions, error);
@@ -192,11 +226,12 @@ export class SessionSubagentHost {
 
   async resume(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
-    const { parent, child, profileName } = await this.ensureIdleSubagent(agentId);
+    const { parent, child, profileName, preserveModelBinding } =
+      await this.ensureIdleSubagent(agentId);
     const completion = this.runWithActiveChild(agentId, options, async (runOptions) => {
       this.emitSubagentSpawned(parent, agentId, profileName, runOptions);
       try {
-        this.reInheritParentModel(parent, child);
+        this.reInheritParentModel(parent, child, preserveModelBinding);
         return await this.runPromptTurn(parent, agentId, child, profileName, runOptions);
       } catch (error) {
         this.emitSubagentFailed(parent, agentId, runOptions, error);
@@ -208,11 +243,12 @@ export class SessionSubagentHost {
 
   async retry(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
-    const { parent, child, profileName } = await this.ensureIdleSubagent(agentId);
+    const { parent, child, profileName, preserveModelBinding } =
+      await this.ensureIdleSubagent(agentId);
     const completion = this.runWithActiveChild(agentId, options, async (runOptions) => {
       try {
         runOptions.signal.throwIfAborted();
-        this.reInheritParentModel(parent, child);
+        this.reInheritParentModel(parent, child, preserveModelBinding);
         this.emitSubagentStarted(parent, agentId);
         const turnId = child.turn.retry('agent-host');
         if (turnId === null) {
@@ -228,9 +264,12 @@ export class SessionSubagentHost {
     return { agentId, profileName, resumed: true, completion };
   }
 
-  private async ensureIdleSubagent(
-    agentId: string,
-  ): Promise<{ readonly parent: Agent; readonly child: Agent; readonly profileName: string }> {
+  private async ensureIdleSubagent(agentId: string): Promise<{
+    readonly parent: Agent;
+    readonly child: Agent;
+    readonly profileName: string;
+    readonly preserveModelBinding: boolean;
+  }> {
     const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
     const metadata = this.session.metadata.agents[agentId];
     if (metadata?.type !== 'sub') {
@@ -245,7 +284,14 @@ export class SessionSubagentHost {
     }
 
     const profileName = child.config.profileName ?? 'subagent';
-    return { parent, child, profileName };
+    return {
+      parent,
+      child,
+      profileName,
+      preserveModelBinding:
+        this.session.experimentalFlags.enabled('secondary-model') ||
+        metadata.modelBinding?.source === 'agent-swarm-item',
+    };
   }
 
   async runQueued<T>(tasks: readonly QueuedSubagentTask<T>[]): Promise<Array<SubagentResult<T>>> {
@@ -440,9 +486,8 @@ export class SessionSubagentHost {
     parent: Agent,
     child: Agent,
     profile: ResolvedAgentProfile,
-    modelChoice?: SubagentModelChoice,
+    binding: SubagentModelBinding,
   ): Promise<void> {
-    const binding = this.resolveSpawnBinding(parent, profile, modelChoice);
     child.config.update({
       cwd: parent.config.cwd,
       modelAlias: binding.modelAlias,
@@ -462,16 +507,15 @@ export class SessionSubagentHost {
   }
 
   /**
-   * The model a newly spawned subagent binds to: the configured secondary
-   * model by default (when the experiment is on), otherwise the parent's
-   * model and effort, inherited as before. The bound alias is validated up
-   * front so a dangling `[secondary_model]` pointer fails the spawn with a
-   * wrapped, actionable error instead of a mid-turn provider failure.
+   * Resolve the host's normal spawn chain: tool choice, profile preference,
+   * configured secondary, then caller. Validation can be deferred while an
+   * AgentSwarm item alias still has a chance to override this baseline.
    */
   private resolveSpawnBinding(
     parent: Agent,
     profile: ResolvedAgentProfile,
-    modelChoice?: SubagentModelChoice,
+    modelChoice: SubagentModelChoice | undefined,
+    validate: boolean,
   ): SubagentModelBinding {
     const binding = resolveSubagentBinding(
       this.session.kimiConfig,
@@ -479,26 +523,69 @@ export class SessionSubagentHost {
       { modelAlias: parent.config.modelAlias, thinkingEffort: parent.config.thinkingEffort },
       modelChoice ?? profile.modelPreference,
     );
-    if (binding.modelAlias !== undefined) {
-      const providerManager = this.session.options.providerManager;
-      try {
-        providerManager?.resolveProviderConfig(binding.modelAlias);
-      } catch (error) {
-        throw wrapSubagentModelError(error, binding.modelAlias, parent.config.modelAlias);
-      }
+    if (validate && binding.modelAlias !== undefined) {
+      const isInheritedCallerModel = binding.modelAlias === parent.config.modelAlias;
+      this.resolveSpawnProvider(
+        parent,
+        binding.modelAlias,
+        parent.config.modelAlias,
+        !isInheritedCallerModel,
+        isInheritedCallerModel,
+      );
     }
     return binding;
   }
 
+  private requireSpawnProvider(
+    parent: Agent,
+    modelAlias: string,
+    callerModelAlias: string | undefined,
+    wrapSecondaryError: boolean,
+  ) {
+    const resolved = this.resolveSpawnProvider(
+      parent,
+      modelAlias,
+      callerModelAlias,
+      wrapSecondaryError,
+      true,
+    );
+    if (resolved === undefined) {
+      throw new Error(`Model alias "${modelAlias}" cannot be resolved.`);
+    }
+    return resolved;
+  }
+
+  private resolveSpawnProvider(
+    parent: Agent,
+    modelAlias: string,
+    callerModelAlias: string | undefined,
+    wrapSecondaryError: boolean,
+    allowParentProvider: boolean,
+  ) {
+    const modelProvider =
+      this.session.options.providerManager ??
+      (allowParentProvider ? parent.modelProvider : undefined);
+    if (modelProvider === undefined) return undefined;
+    try {
+      return modelProvider.resolveProviderConfig(modelAlias);
+    } catch (error) {
+      throw wrapSecondaryError
+        ? wrapSubagentModelError(error, modelAlias, callerModelAlias)
+        : error;
+    }
+  }
+
   /**
    * Resume/retry historically re-synced the child to the parent's current
-   * model so subagents follow mid-session `/model` switches. With the
-   * `secondary-model` experiment on, a resumed subagent instead keeps the
-   * model it was bound to at spawn (v2 semantics: no child-follows-parent
-   * invariant).
+   * model so subagents follow mid-session `/model` switches. Secondary-bound
+   * children and item-bound AgentSwarm children retain their spawn model.
    */
-  private reInheritParentModel(parent: Agent, child: Agent): void {
-    if (this.session.experimentalFlags.enabled('secondary-model')) return;
+  private reInheritParentModel(
+    parent: Agent,
+    child: Agent,
+    preserveModelBinding: boolean,
+  ): void {
+    if (preserveModelBinding) return;
     child.config.update({ modelAlias: parent.config.modelAlias });
   }
 

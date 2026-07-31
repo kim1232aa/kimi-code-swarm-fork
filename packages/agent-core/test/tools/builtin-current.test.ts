@@ -79,6 +79,7 @@ function mockSubagentHost<T extends Partial<SessionSubagentHost>>(
   return {
     spawn: vi.fn(),
     resume: vi.fn(),
+    prepareSpawnBinding: vi.fn(),
     runQueued: vi.fn(),
     getSwarmItem: vi.fn(),
     delegatableSubagents: vi.fn(() => ({})),
@@ -434,6 +435,154 @@ describe('current builtin collaboration tools', () => {
       '</agent_swarm_result>',
     ].join('\n'));
     expect(result.isError).toBeUndefined();
+  });
+
+  it('AgentSwarm preflights strict object items while strings keep normal binding', async () => {
+    const preparedA = {
+      source: 'agent-swarm-item' as const,
+      modelAlias: 'provider/model-a',
+      thinkingEffort: 'high' as const,
+    };
+    const preparedB = {
+      source: 'agent-swarm-item' as const,
+      modelAlias: 'provider/model-b',
+      thinkingEffort: 'medium' as const,
+    };
+    const prepareSpawnBinding = vi
+      .fn()
+      .mockResolvedValueOnce(preparedA)
+      .mockResolvedValueOnce(preparedB);
+    const runQueued = vi.fn(async <T>(tasks: readonly QueuedSubagentTask<T>[]) =>
+      tasks.map((task) => ({ task, status: 'completed' as const, result: 'done' })),
+    );
+    const host = mockSubagentHost({
+      prepareSpawnBinding,
+      runQueued: runQueued as unknown as SessionSubagentHost['runQueued'],
+    });
+    const tool = new AgentSwarmTool(host, mockSwarmMode());
+    const input = {
+      description: 'Review files',
+      subagent_type: 'coder',
+      model: 'secondary' as const,
+      prompt_template: 'Review {{item}}',
+      items: [
+        { item: 'src/a.ts', model_alias: 'provider/model-a' },
+        { item: 'src/b.ts', model_alias: 'provider/model-b', thinking: 'medium' },
+        'Check whether docs mention provider/model-c',
+      ],
+    };
+
+    expect(AgentSwarmToolInputSchema.safeParse(input).success).toBe(true);
+    expect(
+      AgentSwarmToolInputSchema.safeParse({
+        ...input,
+        items: [{ item: 'src/a.ts', model_alias: 'provider/model-a', extra: true }, 'src/b.ts'],
+      }).success,
+    ).toBe(false);
+
+    const result = await executeTool(tool, context(input, 'call_swarm'));
+    const tasks = runQueued.mock.calls[0]?.[0] as readonly QueuedSubagentTask[];
+
+    expect(prepareSpawnBinding).toHaveBeenNthCalledWith(1, {
+      profileName: 'coder',
+      modelChoice: 'secondary',
+      item: { modelAlias: 'provider/model-a', thinking: undefined },
+    });
+    expect(prepareSpawnBinding).toHaveBeenNthCalledWith(2, {
+      profileName: 'coder',
+      modelChoice: 'secondary',
+      item: { modelAlias: 'provider/model-b', thinking: 'medium' },
+    });
+    expect(tasks[0]).toMatchObject({
+      prompt: 'Review src/a.ts',
+      swarmItem: 'src/a.ts',
+      modelChoice: 'secondary',
+      binding: preparedA,
+    });
+    expect(tasks[1]).toMatchObject({
+      prompt: 'Review src/b.ts',
+      swarmItem: 'src/b.ts',
+      binding: preparedB,
+    });
+    expect(tasks[2]).toMatchObject({
+      prompt: 'Review Check whether docs mention provider/model-c',
+      modelChoice: 'secondary',
+      binding: undefined,
+    });
+    expect(prepareSpawnBinding).toHaveBeenCalledTimes(2);
+    expect(result.isError).toBeUndefined();
+  });
+
+  it('AgentSwarm rejects any failed item preflight before queueing the batch', async () => {
+    const prepareSpawnBinding = vi
+      .fn()
+      .mockResolvedValueOnce({
+        source: 'agent-swarm-item',
+        modelAlias: 'provider/model-a',
+        thinkingEffort: 'high',
+      })
+      .mockRejectedValueOnce(new Error('Model alias "provider/missing" is not configured.'));
+    const runQueued = vi.fn();
+    const tool = new AgentSwarmTool(
+      mockSubagentHost({ prepareSpawnBinding, runQueued }),
+      mockSwarmMode(),
+    );
+
+    const result = await executeTool(
+      tool,
+      context({
+        description: 'Review files',
+        prompt_template: 'Review {{item}}',
+        items: [
+          { item: 'src/a.ts', model_alias: 'provider/model-a' },
+          { item: 'src/b.ts', model_alias: 'provider/missing' },
+        ],
+      }),
+    );
+
+    expect(result).toMatchObject({
+      isError: true,
+      output: 'Model alias "provider/missing" is not configured.',
+    });
+    expect(prepareSpawnBinding).toHaveBeenCalledTimes(2);
+    expect(runQueued).not.toHaveBeenCalled();
+  });
+
+  it('AgentSwarm applies a thinking-only item to the normal baseline binding', async () => {
+    const prepared = {
+      source: 'agent-swarm-item' as const,
+      modelAlias: 'provider/secondary',
+      thinkingEffort: 'high' as const,
+    };
+    const prepareSpawnBinding = vi.fn().mockResolvedValue(prepared);
+    const runQueued = vi.fn(async <T>(tasks: readonly QueuedSubagentTask<T>[]) =>
+      tasks.map((task) => ({ task, status: 'completed' as const, result: 'done' })),
+    );
+    const tool = new AgentSwarmTool(
+      mockSubagentHost({
+        prepareSpawnBinding,
+        runQueued: runQueued as unknown as SessionSubagentHost['runQueued'],
+      }),
+      mockSwarmMode(),
+    );
+
+    await executeTool(
+      tool,
+      context({
+        description: 'Review files',
+        model: 'secondary',
+        prompt_template: 'Review {{item}}',
+        items: [{ item: 'src/a.ts', thinking: 'high' }, 'src/b.ts'],
+      }),
+    );
+
+    expect(prepareSpawnBinding).toHaveBeenCalledWith({
+      profileName: 'coder',
+      modelChoice: 'secondary',
+      item: { modelAlias: undefined, thinking: 'high' },
+    });
+    expect(runQueued.mock.calls[0]?.[0]?.[0]).toMatchObject({ binding: prepared });
+    expect(runQueued.mock.calls[0]?.[0]?.[1]).toHaveProperty('binding', undefined);
   });
 
   it('AgentSwarm does not expose permission rule argument matching', () => {

@@ -1,13 +1,21 @@
 import {
+  defaultThinkingEffortFor,
+  resolveThinkingEffort,
+  supportsThinkingEffort,
+  type ThinkingEffort,
+} from '../agent/config/thinking';
+import {
   SECONDARY_DERIVED_MODEL_ALIAS,
   SECONDARY_MODEL_ENV,
   secondaryModelPatch,
   type KimiConfig,
+  type ModelAlias,
   type SecondaryModelConfig,
 } from '../config';
 import { ErrorCodes, KimiError } from '../errors';
 import type { ExperimentalFlagResolver } from '../flags';
 import type { AgentModelPreference } from '../profile';
+import type { ResolvedRuntimeProvider } from './provider-manager';
 
 /**
  * Subagent model binding — the secondary-model half of the spawn decision.
@@ -30,7 +38,19 @@ export type SubagentModelChoice = AgentModelPreference;
 
 export interface SubagentModelBinding {
   readonly modelAlias: string | undefined;
-  readonly thinkingEffort?: string;
+  readonly thinkingEffort?: ThinkingEffort;
+}
+
+export interface AgentSwarmItemBindingRequest {
+  readonly modelAlias?: string;
+  readonly thinking?: string;
+}
+
+/** A fully resolved per-item override, prepared before AgentSwarm starts its batch. */
+export interface SubagentSpawnBinding extends SubagentModelBinding {
+  readonly source: 'agent-swarm-item';
+  readonly modelAlias: string;
+  readonly thinkingEffort: ThinkingEffort;
 }
 
 export function resolveSecondaryModel(
@@ -49,7 +69,7 @@ export function resolveSecondaryModel(
 export function resolveSubagentBinding(
   config: KimiConfig | undefined,
   flags: ExperimentalFlagResolver,
-  own: { readonly modelAlias: string | undefined; readonly thinkingEffort: string },
+  own: { readonly modelAlias: string | undefined; readonly thinkingEffort: ThinkingEffort },
   requested?: SubagentModelChoice,
 ): SubagentModelBinding {
   const secondary = resolveSecondaryModel(config, flags);
@@ -63,6 +83,69 @@ export function resolveSubagentBinding(
     };
   }
   return { modelAlias: own.modelAlias, thinkingEffort: own.thinkingEffort };
+}
+
+/**
+ * Apply an AgentSwarm item selector to the host's normal spawn binding. The
+ * host supplies the baseline so this remains one decision chain: item alias,
+ * swarm model choice, profile preference, configured secondary, then caller.
+ */
+export function resolveAgentSwarmItemBinding(
+  request: AgentSwarmItemBindingRequest,
+  baseline: SubagentModelBinding,
+  resolveProviderConfig: (modelAlias: string) => ResolvedRuntimeProvider,
+): SubagentSpawnBinding {
+  const modelAlias = request.modelAlias ?? baseline.modelAlias;
+  if (modelAlias === undefined) {
+    throw new Error('AgentSwarm cannot resolve an item selector without a caller model.');
+  }
+
+  const resolved = resolveProviderConfig(modelAlias);
+  const model = modelForThinking(resolved);
+  const kimiProtocol = resolved.provider.type === 'kimi';
+  const requestedThinking = normalizeThinking(request.thinking);
+  if (
+    requestedThinking !== undefined &&
+    !supportsThinkingEffort(requestedThinking, model, kimiProtocol)
+  ) {
+    const efforts = model.supportEfforts ?? [];
+    const supported = efforts.length === 0 ? 'off, on' : ['off', ...efforts].join(', ');
+    throw new Error(
+      `Thinking effort "${requestedThinking}" is not supported by model alias "${modelAlias}". Supported efforts: ${supported}.`,
+    );
+  }
+
+  return {
+    source: 'agent-swarm-item',
+    modelAlias,
+    thinkingEffort:
+      requestedThinking === undefined
+        ? defaultThinkingEffortFor(model)
+        : resolveThinkingEffort(requestedThinking, undefined, model, kimiProtocol),
+  };
+}
+
+function normalizeThinking(value: string | undefined): ThinkingEffort | undefined {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === undefined || normalized.length === 0
+    ? undefined
+    : (normalized as ThinkingEffort);
+}
+
+function modelForThinking(resolved: ResolvedRuntimeProvider): ModelAlias {
+  return {
+    provider: resolved.providerName,
+    model: resolved.provider.model,
+    maxContextSize: Math.max(resolved.modelCapabilities.max_context_tokens, 1),
+    capabilities: resolved.alwaysThinking
+      ? ['always_thinking']
+      : resolved.modelCapabilities.thinking
+        ? ['thinking']
+        : [],
+    supportEfforts:
+      resolved.supportEfforts === undefined ? undefined : [...resolved.supportEfforts],
+    defaultEffort: resolved.defaultEffort,
+  };
 }
 
 /**

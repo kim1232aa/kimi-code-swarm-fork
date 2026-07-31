@@ -32,7 +32,17 @@ import { registerAgentToolService } from '#/agent/toolRegistry/toolContribution'
 import { toInputJsonSchema } from '#/tool/input-schema';
 import { IConfigService } from '#/app/config/config';
 import { IFlagService } from '#/app/flag/flag';
-import { ISessionSwarmService, type SessionSwarmTask } from '#/session/swarm/sessionSwarm';
+import { IModelCatalog, type Model } from '#/kosong/model/catalog';
+import {
+  modelSupportsThinking,
+  modelSupportsThinkingEffort,
+  normalizeRequestedThinkingEffort,
+} from '#/kosong/model/thinking';
+import {
+  ISessionSwarmService,
+  type SessionSwarmBinding,
+  type SessionSwarmTask,
+} from '#/session/swarm/sessionSwarm';
 import { ISessionAgentProfileCatalog } from '#/session/sessionAgentProfileCatalog/sessionAgentProfileCatalog';
 import { IAgentProfileService } from '#/agent/profile/profile';
 import {
@@ -51,16 +61,25 @@ import {
   IAgentSwarmTool,
   MAX_AGENT_SWARM_SUBAGENTS,
   PROMPT_TEMPLATE_PLACEHOLDER,
+  type AgentSwarmItem,
   type AgentSwarmToolInput,
 } from './agent-swarm';
 import AGENT_SWARM_DESCRIPTION from './agent-swarm.md?raw';
 
 const DEFAULT_SUBAGENT_TYPE = 'coder';
 
+interface NormalizedAgentSwarmItem {
+  readonly item: string;
+  readonly modelAlias?: string;
+  readonly thinking?: string;
+  readonly hasExplicitBinding: boolean;
+}
+
 interface AgentSwarmSpawnSpec {
   readonly kind: 'spawn';
   readonly index: number;
   readonly item: string;
+  readonly binding?: SessionSwarmBinding;
   readonly prompt: string;
 }
 
@@ -98,6 +117,7 @@ export class AgentSwarmTool implements IAgentSwarmTool {
     @IFlagService private readonly flags: IFlagService,
     @ISessionAgentProfileCatalog private readonly catalog: ISessionAgentProfileCatalog,
     @IAgentProfileService private readonly profile: IAgentProfileService,
+    @IModelCatalog private readonly modelCatalog: IModelCatalog,
   ) {
     this.callerAgentId = scopeContext.agentId;
   }
@@ -152,7 +172,7 @@ export class AgentSwarmTool implements IAgentSwarmTool {
     toolCallId: string,
   ): Promise<string> {
     const profileName = normalizeOptionalString(args.subagent_type) ?? DEFAULT_SUBAGENT_TYPE;
-    let binding: { model: string; thinking?: string } | undefined;
+    let binding: SessionSwarmBinding | undefined;
     if ((args.items?.length ?? 0) > 0) {
       await this.catalog.ready;
       const own = this.profile.data();
@@ -174,13 +194,25 @@ export class AgentSwarmTool implements IAgentSwarmTool {
       }
     }
     const timeoutMs = resolveSubagentTimeoutMs(this.config);
-    const specs = await createAgentSwarmSpecs(args, (agentId) =>
-      this.swarmService.getSwarmItem({ callerAgentId: this.callerAgentId, agentId }),
+    const specs = await createAgentSwarmSpecs(
+      args,
+      (agentId) =>
+        this.swarmService.getSwarmItem({ callerAgentId: this.callerAgentId, agentId }),
+      (item) => this.resolveItemBinding(item, binding),
     );
     const tasks: SessionSwarmTask<AgentSwarmSpec>[] = specs.map((spec) => {
       const descriptionName = spec.kind === 'resume' ? 'resume' : profileName;
+      const data: AgentSwarmSpec =
+        spec.kind === 'resume'
+          ? spec
+          : {
+              kind: 'spawn',
+              index: spec.index,
+              item: spec.item,
+              prompt: spec.prompt,
+            };
       const common = {
-        data: spec,
+        data,
         profileName: spec.kind === 'resume' ? 'subagent' : profileName,
         parentToolCallId: toolCallId,
         prompt: spec.prompt,
@@ -201,7 +233,7 @@ export class AgentSwarmTool implements IAgentSwarmTool {
       return {
         ...common,
         kind: 'spawn' as const,
-        binding,
+        binding: spec.binding,
       };
     });
     const results = await this.swarmService.run({
@@ -209,8 +241,40 @@ export class AgentSwarmTool implements IAgentSwarmTool {
       tasks,
     });
     return renderSwarmResults(
-      results.map(({ task, ...result }) => ({ spec: task.data as AgentSwarmSpec, ...result })),
+      results.map(({ task, ...result }) => ({ spec: task.data, ...result })),
     );
+  }
+
+  private resolveItemBinding(
+    item: NormalizedAgentSwarmItem,
+    fallback: SessionSwarmBinding | undefined,
+  ): SessionSwarmBinding | undefined {
+    if (!item.hasExplicitBinding) return fallback;
+    const modelAlias = item.modelAlias ?? fallback?.model;
+    if (modelAlias === undefined) {
+      return undefined;
+    }
+    const model = this.getConfiguredModel(modelAlias);
+    const thinking = normalizeRequestedThinkingEffort(item.thinking);
+    if (thinking !== undefined && !modelSupportsThinkingEffort(thinking, model, true)) {
+      throw new Error(
+        `Thinking effort "${thinking}" is not supported by model alias "${model.id}". Supported efforts: ${supportedThinkingEfforts(model)}.`,
+      );
+    }
+    return {
+      model: model.id,
+      thinking: thinking ?? (item.modelAlias === undefined ? fallback?.thinking : undefined),
+      strictThinking: thinking !== undefined,
+      source: 'agent-swarm-item',
+    };
+  }
+
+  private getConfiguredModel(alias: string): Model {
+    try {
+      return this.modelCatalog.get(alias);
+    } catch {
+      throw new Error(`Model alias "${alias}" is not configured.`);
+    }
   }
 }
 
@@ -219,12 +283,16 @@ registerAgentToolService(IAgentSwarmTool, AgentSwarmTool, { name: 'AgentSwarm', 
 async function createAgentSwarmSpecs(
   args: AgentSwarmToolInput,
   getResumeItem: (agentId: string) => Promise<string | undefined>,
+  resolveItemBinding: (item: NormalizedAgentSwarmItem) => SessionSwarmBinding | undefined,
 ): Promise<AgentSwarmSpec[]> {
   const resumeEntries = Object.entries(args.resume_agent_ids ?? {}).map(([agentId, prompt]) => ({
     agentId: agentId.trim(),
     prompt: prompt.trim(),
   }));
-  const items = (args.items ?? []).map((item) => item.trim());
+  const items = (args.items ?? []).map((value) => {
+    const item = normalizeAgentSwarmItem(value);
+    return { ...item, binding: resolveItemBinding(item) };
+  });
   const itemCount = items.length;
   const resumeCount = resumeEntries.length;
   const totalCount = resumeCount + itemCount;
@@ -257,7 +325,7 @@ async function createAgentSwarmSpecs(
   }
   if (items.length > 0) {
     const itemPromptTemplate = promptTemplate!;
-    items.forEach((item, index) => {
+    items.forEach(({ item, binding }, index) => {
       const prompt = itemPromptTemplate.split(PROMPT_TEMPLATE_PLACEHOLDER).join(item);
       const previousIndex = seenPrompts.get(prompt);
       if (previousIndex !== undefined) {
@@ -270,11 +338,32 @@ async function createAgentSwarmSpecs(
         kind: 'spawn',
         index: specs.length + 1,
         item,
+        binding,
         prompt,
       });
     });
   }
   return specs;
+}
+
+function normalizeAgentSwarmItem(value: AgentSwarmItem): NormalizedAgentSwarmItem {
+  if (typeof value === 'string') {
+    return { item: value.trim(), hasExplicitBinding: false };
+  }
+  const modelAlias = normalizeOptionalString(value.model_alias);
+  const thinking = normalizeOptionalString(value.thinking);
+  return {
+    item: value.item.trim(),
+    modelAlias,
+    thinking,
+    hasExplicitBinding: modelAlias !== undefined || thinking !== undefined,
+  };
+}
+
+function supportedThinkingEfforts(model: Model): string {
+  if (!modelSupportsThinking(model)) return 'off';
+  const efforts = model.supportEfforts ?? [];
+  return efforts.length === 0 ? 'off, on' : ['off', ...efforts].join(', ');
 }
 
 function hasMinimumAgentSwarmInputs(itemCount: number, resumeCount: number): boolean {

@@ -81,7 +81,12 @@ export class SubAgentEventHandler {
     const { parentToolCallId } = info;
     const swarmProgress = this.agentSwarmProgress.get(parentToolCallId);
     if (swarmProgress !== undefined) {
-      this.applySubagentEventToSwarmProgress(swarmProgress, event, childAgentId);
+      this.applySubagentEventToSwarmProgress(
+        swarmProgress,
+        event,
+        childAgentId,
+        info.swarmIndex,
+      );
       this.requestRender();
       return true;
     }
@@ -506,20 +511,18 @@ export class SubAgentEventHandler {
     progress: AgentSwarmProgressComponent,
     event: Event,
     subagentId: string,
+    swarmIndex: number | undefined,
   ): void {
     if (event.type === 'assistant.delta' || event.type === 'thinking.delta') {
       progress.appendModelDelta({ agentId: subagentId, delta: event.delta });
     } else if (event.type === 'tool.call.started') {
       progress.recordToolCall({ agentId: subagentId, toolCallId: event.toolCallId });
     } else if (event.type === 'agent.status.updated' && event.model !== undefined) {
-      // The bound model alias rides every child status update (emitted right
-      // after spawn). Swarm members share one binding, so the panel shows it
-      // once in the header instead of per cell. `modelDisplayName` falls back
-      // to the alias itself when the entry is unknown (e.g. the synthesized
-      // `__secondary__` derived entry is missing).
-      progress.setModelDisplay(
-        modelDisplayName(event.model, this.host.state.appState.availableModels[event.model]),
-      );
+      progress.setActualModelAlias({
+        agentId: subagentId,
+        swarmIndex,
+        actualModelAlias: event.model,
+      });
     }
   }
 

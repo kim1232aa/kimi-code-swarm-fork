@@ -25,10 +25,17 @@ type SessionSwarmTaskBase<T> = {
   readonly signal?: AbortSignal;
 };
 
+export interface SessionSwarmBinding {
+  readonly model: string;
+  readonly thinking?: string;
+  readonly strictThinking?: boolean;
+  readonly source?: 'agent-swarm-item';
+}
+
 export type SessionSwarmSpawnTask<T = unknown> = SessionSwarmTaskBase<T> & {
   readonly kind: 'spawn';
   readonly resumeAgentId?: undefined;
-  readonly binding?: { readonly model: string; readonly thinking?: string };
+  readonly binding?: SessionSwarmBinding;
 };
 
 export type SessionSwarmResumeTask<T = unknown> = SessionSwarmTaskBase<T> & {

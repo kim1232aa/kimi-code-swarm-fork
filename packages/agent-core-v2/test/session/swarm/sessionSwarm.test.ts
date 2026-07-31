@@ -1151,6 +1151,64 @@ describe('SessionSwarmService metadata compatibility', () => {
     expect(createAgent).not.toHaveBeenCalled();
   });
 
+  it('passes strict item thinking through the spawn binding', async () => {
+    const service = ix.get(ISessionSwarmService);
+    const spawnTask: SessionSwarmSpawnTask = {
+      ...spawnSessionTask('src/a.ts'),
+      kind: 'spawn',
+      binding: {
+        model: 'provider/secondary',
+        thinking: 'high',
+        strictThinking: true,
+        source: 'agent-swarm-item',
+      },
+    };
+
+    await expect(
+      service.run({
+        callerAgentId: 'main',
+        tasks: [spawnTask],
+      }),
+    ).resolves.toMatchObject([{ status: 'completed', agentId: 'agent-new' }]);
+
+    expect(createAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        binding: {
+          profile: 'coder',
+          model: 'provider/secondary',
+          thinking: 'high',
+          strictThinking: true,
+        },
+      }),
+    );
+  });
+
+  it('does not blame secondary config for an item-sourced model error', async () => {
+    const service = ix.get(ISessionSwarmService);
+    const spawnTask: SessionSwarmSpawnTask = {
+      ...spawnSessionTask('src/a.ts'),
+      kind: 'spawn',
+      binding: {
+        model: 'provider/bad',
+        thinking: 'low',
+        source: 'agent-swarm-item',
+      },
+    };
+
+    await expect(
+      service.run({
+        callerAgentId: 'main',
+        tasks: [spawnTask],
+      }),
+    ).resolves.toMatchObject([
+      {
+        status: 'failed',
+        error: expect.not.stringContaining('comes from [secondary_model].model / KIMI_SECONDARY_MODEL'),
+      },
+    ]);
+    expect(createAgent).not.toHaveBeenCalled();
+  });
+
   it('does not emit spawned again when a rate-limited child retries', async () => {
     vi.useFakeTimers();
     try {

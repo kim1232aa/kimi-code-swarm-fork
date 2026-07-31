@@ -1,0 +1,25 @@
+{
+  "name": "multi-model-swarm",
+  "version": "0.31.0+swarm.1",
+  "description": "Workflow helpers and compatibility checks for per-item AgentSwarm model routing.",
+  "keywords": ["agent-swarm", "multi-model", "routing"],
+  "license": "MIT",
+  "skills": "./skills/",
+  "sessionStart": {
+    "skill": "using-multi-model-swarm"
+  },
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "AgentSwarm",
+      "command": "node ./hooks/validate-agent-swarm.mjs",
+      "timeout": 5
+    }
+  ],
+  "commands": "./commands/",
+  "interface": {
+    "displayName": "Multi-model AgentSwarm",
+    "shortDescription": "Per-item model routing helpers for AgentSwarm",
+    "developerName": "Kimi Code Swarm Fork"
+  }
+}

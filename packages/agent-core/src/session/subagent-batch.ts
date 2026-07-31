@@ -6,7 +6,7 @@ import type {
   SpawnSubagentOptions,
   SubagentHandle,
 } from './subagent-host';
-import type { SubagentModelChoice } from './subagent-binding';
+import type { SubagentModelChoice, SubagentSpawnBinding } from './subagent-binding';
 import { isUserCancellation } from '../utils/abort';
 
 /*
@@ -57,6 +57,7 @@ type BaseQueuedSubagentTask<T> = {
 
 export type SpawnQueuedSubagentTask<T = unknown> = BaseQueuedSubagentTask<T> & {
   readonly kind: 'spawn';
+  readonly binding?: SubagentSpawnBinding;
   readonly resumeAgentId?: undefined;
 };
 
@@ -327,6 +328,7 @@ export class SubagentBatch<T> {
           profileName: task.profileName,
           swarmItem: task.swarmItem,
           modelChoice: task.modelChoice,
+          binding: task.binding,
           ...runOptions,
         };
         handle = await this.launcher.spawn(spawnOptions);

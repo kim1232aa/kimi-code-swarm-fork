@@ -33,7 +33,11 @@ import { runPluginNodeEntry } from './cli/sub/plugin-run-node';
 import { handleUpgrade } from './cli/sub/upgrade';
 import { createCliTelemetryBootstrap, initializeCliTelemetry } from './cli/telemetry';
 import { runUpdatePreflight } from './cli/update/preflight';
-import { createKimiCodeHostIdentity, getVersion } from './cli/version';
+import {
+  createKimiCodeHostIdentity,
+  getVersion,
+  installSwarmRuntimeMetadata,
+} from './cli/version';
 import { CLI_SHUTDOWN_TIMEOUT_MS, CLI_UI_MODE, PROCESS_NAME } from './constant/app';
 import { cleanupStaleNativeCacheForCurrent } from './native/native-assets';
 import { installNativeModuleHook } from './native/module-hook';
@@ -154,6 +158,7 @@ export function main(): void {
   });
 
   const version = getVersion();
+  installSwarmRuntimeMetadata(version);
 
   const program = createProgram(
     version,

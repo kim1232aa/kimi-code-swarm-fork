@@ -167,28 +167,52 @@ describe('AgentSwarmProgressComponent', () => {
     expect(output).not.toContain('01');
   });
 
-  it('shows the bound model display name in the header', () => {
+  it('shows each object item requested model on its own row', () => {
     const component = createComponent();
+    component.updateArgs({
+      description: DEFAULT_DESCRIPTION,
+      prompt_template: 'Review {{item}}',
+      items: [
+        { item: 'src/a.ts', model_alias: 'provider/model-a' },
+        'src/b.ts',
+      ],
+    });
 
-    component.setModelDisplay('kimi-k2-thinking');
-    const lines = renderLines(component);
-    const headerLine = lines.find((line) => line.includes('Agent Swarm'));
+    const output = renderText(component, 140);
 
-    expect(headerLine).toBeDefined();
-    expect(headerLine).toContain('Review changed files ─ kimi-k2-thinking');
+    expect(output).toContain('[requested: provider/model-a]');
+    expect(output).toContain('src/a.ts');
+    expect(output).toContain('src/b.ts');
+    expect(output).not.toContain('Agent Swarm ─ Review changed files ─ provider/model-a');
   });
 
-  it('keeps the first reported model when later status updates differ', () => {
+  it('shows the actual model per member after a status update', () => {
     const component = createComponent();
+    component.updateArgs({
+      description: DEFAULT_DESCRIPTION,
+      prompt_template: 'Review {{item}}',
+      items: [{ item: 'src/a.ts', model_alias: 'provider/model-a' }, 'src/b.ts'],
+    });
+    component.registerSubagent({ agentId: 'agent-1', swarmIndex: 1 });
+    component.setActualModelAlias({ agentId: 'agent-1', actualModelAlias: 'provider/model-a' });
 
-    component.setModelDisplay('kimi-k2-thinking');
-    component.setModelDisplay('other-model');
-    component.setModelDisplay('');
+    const output = renderText(component, 140);
 
-    const output = renderText(component);
+    expect(output).toContain('[actual/requested: provider/model-a]');
+    expect(output).not.toContain('first reported model');
+  });
 
-    expect(output).toContain('kimi-k2-thinking');
-    expect(output).not.toContain('other-model');
+  it('shows the actual model for a resumed member without a requested alias', () => {
+    const component = createComponent();
+    component.updateArgs({
+      description: DEFAULT_DESCRIPTION,
+      resume_agent_ids: { 'agent-resume': 'continue' },
+    });
+    component.setActualModelAlias({ agentId: 'agent-resume', actualModelAlias: 'provider/resume-model' });
+
+    const output = renderText(component, 140);
+
+    expect(output).toContain('[actual: provider/resume-model]');
   });
 
   it('repaints from the active palette when the theme changes', () => {
