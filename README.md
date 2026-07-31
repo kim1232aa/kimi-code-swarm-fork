@@ -9,7 +9,7 @@ Requirements: Node.js 24.15+ and pnpm 10.33.0.
 Clone this fork and build it once:
 
 ```bash
-git clone --branch multi-model-swarm-0.31 https://github.com/kim1232aa/kimi-code-swarm-fork.git "$HOME/kimi-code-multimodel-swarm"
+git clone https://github.com/kim1232aa/kimi-code-swarm-fork.git "$HOME/kimi-code-multimodel-swarm"
 cd "$HOME/kimi-code-multimodel-swarm"
 pnpm install --frozen-lockfile
 pnpm run build:packages
